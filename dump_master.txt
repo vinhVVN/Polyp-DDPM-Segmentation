@@ -1,0 +1,2870 @@
+NOTEBOOK: polypddpm-master.ipynb
+Total cells: 87
+
+============================== CELL 0 (MARKDOWN) ==============================
+# Polyp-DDPM 
+
+
+
+============================== CELL 1 (CODE) ==============================
+ACTION = "PRESENT_ONLY"  #
+INPUT_ROOT = "/kaggle/input"
+OUTPUT_DIR = "/kaggle/working/polyp_ddpm_report_master_v400"
+RESUME_MASTER_OUTPUT = '/kaggle/input/notebooks/trumbomhang/polypddpm-master-full/polyp_ddpm_report_master_v400' 
+SESSION_HOURS = 9.0
+INSTALL_MISSING = True
+
+PATHS = {
+    "images": '/kaggle/input/datasets/debeshjha1/kvasirseg/Kvasir-SEG/Kvasir-SEG/images', "masks": '/kaggle/input/datasets/debeshjha1/kvasirseg/Kvasir-SEG/Kvasir-SEG/masks',  
+    "own": '/kaggle/input/notebooks/thnhvinhs/polyp-ddpm-master-end-to-end-2/polyp_ddpm_report_master_recovery_v130',                  
+    "color": '/kaggle/input/notebooks/thnhvinhs/polyp-ddpm-master-end-to-end-3/polyp_ddpm_trained_color_repair_v141',                 
+    "texture_v1": '/kaggle/input/notebooks/thnhvinhs/polyp-ddpm-texture-refinement/polyp_ddpm_texture_t4x2_v100',         
+    "v2": '/kaggle/input/notebooks/thnhvinhs/polyp-ddpm-restoration/polyp_ddpm_background_repair_v200',                    
+    "v21": '/kaggle/input/notebooks/thnhvinhs/polypddpm-v2-continuation-boundary-protected/polyp_ddpm_v2_continuation_v210',                   
+    "author": '/kaggle/input/datasets/thnhvinhs/polyp-ddpm-author/polyp_ddpm_author.pt',                
+}
+
+
+
+SETTINGS = {
+    'seed': 42,
+    'split_seed': 42,
+    'size': 256,
+    'run_additional_refiner': True,
+    'continuation_from': 'last',
+    'continuation_lr': 5e-07,
+    'own_steps': 10000,
+    'own_lr': 0.0001,
+    'own_per_gpu_batch': 4,
+    'own_accumulation': 4,
+    'color_steps': 2000,
+    'color_lr': 0.0002,
+    'color_batch': 8,
+    'color_train_size': 128,
+    'lut_dim': 17,
+    'color_split_seed': 14042,
+    'color_val_images': 90,
+    'color_cache_train': 32,
+    'color_cache_val': 8,
+    'color_validation_n': 16,
+    'color_validate_every': 200,
+    'color_save_every': 100,
+    'rebuild_refiner_steps': 1000,
+    'demo_cases': 4,
+    'demo_replicates': 3,
+    'quality_n': 100,
+    'fid_enabled': False,
+    'seg_steps': 2000,
+    'seg_batch': 8,
+    'seg_lr': 0.0001,
+    'encoder_weights': 'imagenet',
+    'eval_batch': 8,
+    'prediction_cases': 6,
+    'save_all_predictions': True,
+    'save_every': 100,
+    'cpu_threads_per_rank': 2,
+    'disable_p2p': True,
+    'host_rss_limit_gib': 20.0,
+    'host_free_min_gib': 3.0,
+    'host_memory_fraction': 0.8,
+    'refiner_target_total': 49000,
+    'milestone_totals': [3500, 10000, 20000, 30000, 40000, 49000],
+}
+
+
+============================== CELL 2 (MARKDOWN) ==============================
+### A Set up 2. Môi trường
+
+DDPM/refiner dùng DDP trên hai GPU. Sinh ảnh cuối chia task giữa hai GPU. Downstream giữ một GPU cho mỗi nhánh để bảo toàn batch 8 và thống kê BatchNorm; GPU thứ hai có thể rảnh khi chỉ còn một nhánh cần train.
+
+
+============================== CELL 3 (CODE) ==============================
+import gc, sys, subprocess, importlib.util
+from pathlib import Path
+from IPython.display import display, Markdown
+
+required = {
+    "pandas": "pandas", "numpy": "numpy", "PIL": "Pillow",
+    "matplotlib": "matplotlib", "psutil": "psutil", "scipy": "scipy",
+    "tqdm": "tqdm", "lpips": "lpips",
+    "segmentation_models_pytorch": "segmentation-models-pytorch==0.5.0",
+}
+missing = [package for module, package in required.items()
+           if importlib.util.find_spec(module) is None]
+if missing:
+    if not INSTALL_MISSING:
+        raise RuntimeError("Thiếu packages: " + str(missing))
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *missing])
+
+import torch, numpy as np, pandas as pd
+print("PyTorch:", torch.__version__)
+if torch.cuda.device_count() < 2:
+    raise RuntimeError("Chọn Kaggle Settings → Accelerator → GPU T4 x2.")
+for index in range(2):
+    print(f"GPU{index}: {torch.cuda.get_device_name(index)}")
+# Download LPIPS/AlexNet once before two workers start.
+if ACTION in ["REPORT_AND_EXTEND", "REBUILD"]:
+    import lpips
+    _perceptual = lpips.LPIPS(net="alex", verbose=False).eval()
+    del _perceptual
+    gc.collect()
+
+--- OUTPUTS (1) ---
+  [out 0: stream] PyTorch: 2.11.0+cu130 GPU0: Tesla T4 GPU1: Tesla T4 
+
+
+============================== CELL 4 (MARKDOWN) ==============================
+### A 3. Khôi phục dữ kiện
+Khôi phục bank, checkpoint và log đã lưu. Dữ liệu, split, nguồn weights và recipe downstream phải tương thích. 
+
+
+============================== CELL 5 (CODE) ==============================
+RUN = prepare_report(
+    PATHS, SETTINGS, RUNTIME_SOURCES, OUTPUT_DIR, INPUT_ROOT,
+    SESSION_HOURS, RESUME_MASTER_OUTPUT, action=ACTION,
+)
+report.initialize(RUN)
+report.progress()
+
+--- OUTPUTS (2) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 6 (MARKDOWN) ==============================
+### Cấu hình hiển thị và các hàm đọc dữ kiện
+Cell dưới chỉ chứa hàm đọc file và lưu hình/bảng, không huấn luyện hoặc tự sinh lời diễn giải. Các lệnh vẽ, chọn cột và `display` nằm ngay ở cell tạo output. Chỉnh `N_CASES`/`DISPLAY_IDS` để đổi những ảnh muốn trình bày.
+
+
+============================== CELL 7 (CODE) ==============================
+import matplotlib.pyplot as plt
+from PIL import Image
+from common import digest
+from io import BytesIO
+from IPython.display import Image as InlineImage
+
+
+def show_inline(fig):
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=130, bbox_inches="tight")
+    display(InlineImage(data=buffer.getvalue()))
+    plt.close(fig)
+
+
+N_CASES = 3                # Số case trong mỗi gallery
+DISPLAY_IDS = None         # None = dùng case có sẵn của từng stage; hoặc ['ID1', 'ID2']
+SHOW_RESEARCH_MILESTONES = True
+
+
+def save_table(frame, filename, section):
+    path = Path(OUTPUT_DIR) / "tables" / filename
+    frame.to_csv(path, index=False)
+    relative = str(path.relative_to(Path(OUTPUT_DIR)))
+    report.base.ARTIFACTS[:] = [a for a in report.base.ARTIFACTS if a['file'] != relative]
+    report.base.register(path, section, filename)
+
+
+def save_figure(fig, filename, section):
+    path = Path(OUTPUT_DIR) / "figures" / filename
+    fig.tight_layout()
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    relative = str(path.relative_to(Path(OUTPUT_DIR)))
+    report.base.ARTIFACTS[:] = [a for a in report.base.ARTIFACTS if a['file'] != relative]
+    report.base.register(path, section, filename)
+
+
+def read_history(role):
+    stage = report.stage_root(role)
+    if stage is None:
+        return pd.DataFrame(), pd.DataFrame([{'Giai đoạn': role, 'Trạng thái': 'Chưa attach nguồn'}])
+    identity = stage / 'protocol.json'
+    protocol = json.loads(identity.read_text())['protocol'] if identity.exists() else {}
+    history = pd.DataFrame()
+    checkpoint_candidates = [stage/'checkpoints/last.pt']
+    if role == 'own':
+        checkpoint_candidates = [stage/'generator/last.pt', *checkpoint_candidates]
+    if role == 'color':
+        checkpoint_candidates = [stage/'color/checkpoints/last.pt', stage/'color/last.pt', *checkpoint_candidates]
+    step = None
+    for checkpoint in checkpoint_candidates:
+        if checkpoint.exists():
+            state = load_pt(checkpoint)
+            accepted = [json.loads(identity.read_text())['hash']] if identity.exists() else [state.get('protocol')]
+            accepted += protocol.get('accepted_resume_protocols', [])
+            if state.get('protocol') not in accepted:
+                raise ValueError('Checkpoint khác nguồn lịch sử: ' + role)
+            history = pd.DataFrame(state.get('history', []))
+            step = int(state.get('step', 0))
+            del state
+            gc.collect()
+            break
+    if history.empty:
+        for filename in ['color_training_history.csv', 'training_history.csv', 'history.csv']:
+            path = stage / 'tables' / filename
+            if path.exists() and path.stat().st_size > 2:
+                history = pd.read_csv(path)
+                break
+    if 'update' in history and 'step' not in history:
+        history = history.rename(columns={'update': 'step'})
+    if not history.empty and 'step' in history:
+        history = history.sort_values('step').drop_duplicates('step').copy()
+        if step is None:
+            step = int(history.step.max())
+        history = history[history.step <= step].copy()
+        cfg = protocol.get('config', protocol.get('settings', {}))
+        batch = cfg.get('effective_batch') or cfg.get('per_gpu_batch', 2)*cfg.get('world_size', 2)*cfg.get('accumulation', 2)
+        if role == 'own':
+            batch = cfg.get('effective_batch', RUN['own_per_gpu_batch']*RUN['world_size']*RUN['own_accumulation'])
+        if role == 'color':
+            batch = cfg.get('color_batch', RUN['color_batch'])
+        n = 900 if role == 'own' else 810
+        history['data_pass_equivalent'] = history.step * batch / n
+    initial = int(protocol.get('initial_refiner_updates', 0))
+    status = pd.DataFrame([{
+        'Giai đoạn': role, 'Update LAST của stage': step, 'Bản ghi log': len(history),
+        'Tổng refiner LAST': initial+step if step is not None and role not in ['own','color'] else None,
+        'Trạng thái': 'Có dữ kiện' if not history.empty else 'Chưa có log',
+    }])
+    return history, status
+
+
+def intermediate_rows(stage_name, limit=N_CASES, ids=None):
+    rec = {r['id']: r for r in RUN['records']}
+    color_root = report.stage_root('color')
+    if color_root is None:
+        return pd.DataFrame()
+    manifest_path = color_root/'synthetic/manifest.json'
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {'images':[]}
+    color_rows = {r['id']:r for r in manifest.get('images',[])}
+    candidates = []
+    def collect(folder, role, total=None):
+        if folder is None or not Path(folder).exists():
+            return
+        for path in sorted(Path(folder).glob('*.png')):
+            sid = path.stem.split('__r')[0]
+            if sid not in rec or (ids is not None and sid not in ids):
+                continue
+            if '__r' in path.stem and not path.stem.endswith('__r0'):
+                continue
+            # Direct deployment images and color-teacher caches never enter intermediate galleries.
+            if path.is_relative_to(Path(OUTPUT_DIR)/'author') or path.is_relative_to(color_root/'color/cache/author'):
+                raise ValueError('Không dùng ảnh deployment/teacher cho gallery trung gian')
+            sidecar = path.with_suffix('.json')
+            if sidecar.exists():
+                saved = json.loads(sidecar.read_text())
+                if saved.get('png_sha256') and digest(path) != saved['png_sha256']:
+                    raise ValueError('PNG trung gian bị thay đổi: '+str(path))
+            source = color_root/'synthetic/images'/(sid+'.png')
+            raw = color_root/'color/raw_bank'/(sid+'.png')
+            if stage_name in ['own','color']:
+                source = path if stage_name == 'own' else raw
+            if not source.exists():
+                continue
+            row = color_rows.get(sid,{})
+            if row.get('raw_sha256') and raw.exists() and digest(raw)!=row['raw_sha256']:
+                raise ValueError('Raw bank thay đổi: '+sid)
+            if stage_name=='color' and row.get('sha256') and digest(path)!=row['sha256']:
+                raise ValueError('Color bank thay đổi: '+sid)
+            candidates.append({'id':sid, 'stage':role, 'image':str(path), 'source':str(source),
+                'real':rec[sid]['image'], 'mask':rec[sid]['mask'], 'actual_updates':total,
+                'method':row.get('method',manifest.get('method',''))})
+    origin = manifest.get('generator_origin', {})
+    if not origin:
+        cp = color_root/'protocol.json'
+        origin = json.loads(cp.read_text())['protocol'].get('generator_origin',{}) if cp.exists() else {}
+    if stage_name == 'own':
+        collect(color_root/'color/raw_bank','DDPM RAW',origin.get('source_step'))
+        if not candidates:
+            collect(color_root/'color/cache/student','DDPM RAW (cache)',origin.get('source_step'))
+    elif stage_name == 'color':
+        collect(color_root/'synthetic/images','Sau sửa màu',origin.get('source_step'))
+    elif stage_name in ['texture','background','boundary']:
+        role = {'texture':'texture_v1','background':'v2','boundary':'v21'}[stage_name]
+        stage = report.stage_root(role)
+        parent_v2 = report.stage_root('v2')
+        if stage_name=='texture' and parent_v2 is not None and (parent_v2/'pilot/legacy_60').exists():
+            p=json.loads((parent_v2/'protocol.json').read_text())['protocol']
+            collect(parent_v2/'pilot/legacy_60','Texture · sampler60',p.get('initial_refiner_updates'))
+        elif stage is not None:
+            p=json.loads((stage/'protocol.json').read_text())['protocol']
+            decision_path=stage/'decision.json'
+            decision=json.loads(decision_path.read_text()) if decision_path.exists() else {}
+            total=decision.get('total_selected_refiner_updates')
+            if total is None and decision.get('selected_checkpoint_update') is not None:
+                total=int(p.get('initial_refiner_updates',0))+int(decision['selected_checkpoint_update'])
+            steps=p.get('config',{}).get('default_reverse_steps',60 if stage_name=='texture' else 120)
+            folder=stage/'pilot'/('trained_guard' if stage_name=='boundary' else f'tuned_{steps}')
+            collect(folder,{'texture':'Texture','background':'Nền v2','boundary':'Bảo vệ biên v2.1'}[stage_name],total)
+    elif stage_name.startswith('milestone:'):
+        total=int(stage_name.split(':')[1])
+        folder=Path(OUTPUT_DIR)/'research_49k/milestones'/f'step_{total:06d}'
+        marker=folder/'manifest.json'
+        if marker.exists():
+            m=json.loads(marker.read_text())
+            if int(m['total_updates'])!=total:
+                raise ValueError('Mốc ảnh khác metadata')
+            collect(folder, f'Refiner LAST {total:,}', total)
+    frame = pd.DataFrame(candidates)
+    if frame.empty:
+        return frame
+    if ids is not None:
+        frame['order']=frame.id.map({sid:i for i,sid in enumerate(ids)})
+        frame=frame.sort_values('order').drop(columns='order')
+    return frame.head(limit).reset_index(drop=True)
+
+
+============================== CELL 8 (MARKDOWN) ==============================
+## B. Nạp dữ liệu và tạo split
+### B 1. Ghép cặp theo ID và kiểm tra dữ liệu
+Kvasir-SEG gồm ảnh nội soi RGB và segmentation mask. Một mẫu là **cặp cùngID**, không phải hai danh sách được ghép theo thứ tự tùy ý. Kiểm tra đủ cặp, kích thước khớp và mask không rỗng/toàn trắng trước khi huấn luyện.
+
+
+============================== CELL 9 (CODE) ==============================
+def dataset_maps(image_dir, mask_dir, input_root):
+    def maps(path):
+        result = {}
+        for p in Path(path).iterdir():
+            if p.is_file() and p.suffix.lower() in [
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".bmp",
+                ".tif",
+                ".tiff",
+            ]:
+                if p.stem in result:
+                    raise ValueError("Duplicate ID: " + p.stem)
+                result[p.stem] = str(p)
+        return result
+
+    if bool(image_dir) != bool(mask_dir):
+        raise ValueError("Set both images and masks, or leave both None")
+    candidates = (
+        [(Path(image_dir), Path(mask_dir))]
+        if image_dir
+        else [
+            (p, p.parent / "masks")
+            for p in Path(input_root).rglob("images")
+            if "kvasir" in str(p).lower() and (p.parent / "masks").is_dir()
+        ]
+    )
+    good = []
+    for a, b in candidates:
+        im, ma = maps(a), maps(b)
+        if len(set(im) & set(ma)) == 1000 and set(im) == set(ma):
+            good.append((im, ma))
+    if len(good) != 1:
+        raise ValueError(
+            "Set PATHS images/masks: expected exactly one paired Kvasir1000 dataset"
+        )
+    return good[0]
+
+
+============================== CELL 10 (MARKDOWN) ==============================
+### B 2. Tạo train/test
+Sắp xếpID, dùng RNGseed 42 để xáo trộn, lấy 900 train và 100 test. Code kiểm tra không giao nhau. Khi tiếp tục output cũ, split được tạo lại và phải khớp membership lịch sử; không chia mới để có số đẹp hơn.
+
+Split ngẫu nhiên theo ảnh không bảo đảm độc lập bệnh nhân/video. Test 100 dùng để đánh giá cuối, không chọn best checkpoint.
+
+
+============================== CELL 11 (CODE) ==============================
+def make_split(images, masks, seed):
+    ids = np.asarray(sorted(set(images) & set(masks)))
+    if len(ids) != 1000 or set(images) != set(masks):
+        raise ValueError("Expected 1000 correctly paired IDs")
+    order = np.random.default_rng(seed).permutation(len(ids))
+    train = ids[order[:900]].tolist()
+    test = ids[order[900:]].tolist()
+    assert not set(train) & set(test) and len(set(train + test)) == 1000
+    return {
+        "dataset": "Kvasir-SEG",
+        "seed": int(seed),
+        "train_count": 900,
+        "test_count": 100,
+        "method": "sorted matched IDs -> default_rng(seed).permutation -> first900/rest100",
+        "train": train,
+        "test": test,
+    }
+
+
+============================== CELL 12 (CODE) ==============================
+from orchestrator import dataset_maps, make_split
+_images, _masks = dataset_maps(PATHS["images"], PATHS["masks"], INPUT_ROOT)
+CHECK_SPLIT = make_split(_images, _masks, RUN["split_seed"])
+assert CHECK_SPLIT == RUN["split"]
+report.base.data_overview()
+
+--- OUTPUTS (3) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:    split  images 0   test     100 1  train     900
+  [out 1: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 2: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 13 (MARKDOWN) ==============================
+Histogram diện tích cho biết polyp nhỏ chiếm bao nhiêu trường hợp; đây là lý do bổ sung đánh giá theo kích thước ở phầnL.
+
+
+============================== CELL 14 (MARKDOWN) ==============================
+## C. Tiền xử lý và tạo minibatch
+### C 1. Biến đổi đồng bộ ảnh–mask
+RGB resize bilinear; mask resize nearest và nhị phân hóa. Flip và rotation lấy cùng tham số cho cả ảnh lẫn mask. Resize mask bằng nội suy trơn rồi dùng như nhãn liên tục có thể làm sai biên.
+
+
+============================== CELL 15 (CODE) ==============================
+def tensor_pair(record, size, seed=None, synthetic=None):
+    with Image.open(synthetic or record["image"]) as handle:
+        image = handle.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+    with Image.open(record["mask"]) as handle:
+        mask = handle.convert("L").resize((size, size), Image.Resampling.NEAREST)
+    if seed is not None:
+        rng = random.Random(int(seed))
+        if rng.random() < 0.5:
+            image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        angle = rng.uniform(-45, 45)
+        image = image.rotate(angle, Image.Resampling.BILINEAR)
+        mask = mask.rotate(angle, Image.Resampling.NEAREST)
+    x = torch.from_numpy(np.asarray(image).copy().transpose(2, 0, 1)).float() / 255
+    y = torch.from_numpy((np.asarray(mask) > 127).astype("float32").copy())[None]
+    return x, y
+
+
+def stream_ids(ids, positions, seed):
+    cache = {}
+    chosen = []
+    for position in positions:
+        epoch, index = divmod(int(position), len(ids))
+        if epoch not in cache:
+            cache[epoch] = np.random.default_rng(seed + epoch).permutation(len(ids))
+        chosen.append(ids[int(cache[epoch][index])])
+    return chosen
+
+
+============================== CELL 16 (MARKDOWN) ==============================
+### C 2. tensor
+- DDPM nhận RGB `[-1,1]` và mask lặp 3 kênh `{-1,+1}`; nối thành 6 kênh.
+- Segmenter nhận ảnh`[0,1]`, chuẩn hóa ImageNet đúng một lần; target 1 kênh`{0,1}`.
+- Vị trí mẫu phụ thuộc global update và seed; resume không quay lại đầu luồng dữ liệu.
+
+
+============================== CELL 17 (CODE) ==============================
+report.base.preprocessing()
+from common import tensor_pair
+records = {row["id"]: row for row in RUN["records"]}
+x, y = tensor_pair(records[RUN["train_ids"][0]], RUN["size"])
+contracts = pd.DataFrame([
+    {"Tensor": "RGB", "Shape": tuple(x.shape), "Min": float(x.min()), "Max": float(x.max())},
+    {"Tensor": "Mask", "Shape": tuple(y.shape), "Min": float(y.min()), "Max": float(y.max())},
+])
+report.table(contracts, "tensor_check_v4.csv", "Tiền xử lý", "Kiểm tra tensor thật sau xử lý.")
+del x, y
+
+--- OUTPUTS (3) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain:                 tensor          shape    range 0      generator image  (3, 256, 256)   [-1,1] 1       condition mask  (3, 256, 256)  {-1,+1} 2  segmentation target  (1, 256, 256)    {0,1}
+  [out 2: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 18 (MARKDOWN) ==============================
+## D. Kiến trúc và cơ chế DDPM
+### D 1. Denoising U-Net
+Input: noisyRGB 3 kênh + conditionmask 3 kênh. Output: epsilonRGB 3 kênh. Timestep embedding thông báo mức nhiễu; encoder/decoder và skip connection giữ thông tin vị trí.
+
+Các block sâu được thu gọn; cell tạo model và kết quả shape nằm ngay dưới để tiện trình bày. Giữ đúng cấu trúc để nạp checkpoint tương thích.
+
+
+============================== CELL 19 (CODE) ==============================
+def timestep_embedding(timesteps, dim, max_period=1000):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    half = dim // 2
+    freqs = th.exp(
+        -math.log(max_period) * th.arange(start=0, end=half, dtype=th.float32) / half
+    ).to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = th.cat([th.cos(args), th.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
+class ResBlock(TimestepBlock):
+    """
+    A residual block that can optionally change the number of channels.
+    :param channels: the number of input channels.
+    :param emb_channels: the number of timestep embedding channels.
+    :param dropout: the rate of dropout.
+    :param out_channels: if specified, the number of out channels.
+    :param use_conv: if True and out_channels is specified, use a spatial
+        convolution instead of a smaller 1x1 convolution to change the
+        channels in the skip connection.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param use_checkpoint: if True, use gradient checkpointing on this module.
+    :param up: if True, use this block for upsampling.
+    :param down: if True, use this block for downsampling.
+    """
+
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        dims=2,
+        use_checkpoint=False,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims)
+            self.x_upd = Upsample(channels, False, dims)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims)
+            self.x_upd = Downsample(channels, False, dims)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        """
+        Apply the block to a Tensor, conditioned on a timestep embedding.
+        :param x: an [N x C x ...] Tensor of features.
+        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
+
+    def _forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
+
+
+============================== CELL 20 (CODE) ==============================
+class UNetModel(nn.Module):
+    """
+    The full UNet model with attention and timestep embedding.
+    :param in_channels: channels in the input Tensor.
+    :param model_channels: base channel count for the model.
+    :param out_channels: channels in the output Tensor.
+    :param num_res_blocks: number of residual blocks per downsample.
+    :param attention_resolutions: a collection of downsample rates at which
+        attention will take place. May be a set, list, or tuple.
+        For example, if this contains 4, then at 4x downsampling, attention
+        will be used.
+    :param dropout: the dropout probability.
+    :param channel_mult: channel multiplier for each level of the UNet.
+    :param conv_resample: if True, use learned convolutions for upsampling and
+        downsampling.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param num_classes: if specified (as an int), then this model will be
+        class-conditional with `num_classes` classes.
+    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
+    :param num_heads: the number of attention heads in each attention layer.
+    :param num_heads_channels: if specified, ignore num_heads and instead use
+                               a fixed channel width per attention head.
+    :param num_heads_upsample: works with num_heads to set a different number
+                               of heads for upsampling. Deprecated.
+    :param use_scale_shift_norm: use a FiLM-like conditioning mechanism.
+    :param resblock_updown: use residual blocks for up/downsampling.
+    :param use_new_attention_order: use a different attention pattern for potentially
+                                    increased efficiency.
+    """
+
+    def __init__(
+        self,
+        image_size,
+        in_channels,
+        model_channels,
+        out_channels,
+        num_res_blocks,
+        attention_resolutions,
+        dropout=0,
+        channel_mult=(1, 2, 4, 8),
+        conv_resample=True,
+        dims=2,
+        num_classes=None,
+        use_checkpoint=False,
+        use_fp16=False,
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=False,
+        resblock_updown=False,
+        use_new_attention_order=False,
+    ):
+        super().__init__()
+
+        if num_heads_upsample == -1:
+            num_heads_upsample = num_heads
+
+        self.image_size = image_size
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.attention_resolutions = attention_resolutions
+        self.dropout = dropout
+        self.channel_mult = channel_mult
+        self.conv_resample = conv_resample
+        self.num_classes = num_classes
+        self.use_checkpoint = use_checkpoint
+        self.dtype = th.float16 if use_fp16 else th.float32
+        self.num_heads = num_heads
+        self.num_head_channels = num_head_channels
+        self.num_heads_upsample = num_heads_upsample
+
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
+
+        if self.num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+
+        ch = input_ch = int(channel_mult[0] * model_channels)
+        self.input_blocks = nn.ModuleList(
+            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
+        )
+        self._feature_size = ch
+        input_block_chans = [ch]
+        ds = 1
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [
+                    ResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=int(mult * model_channels),
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                ch = int(mult * model_channels)
+                if ds in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            use_checkpoint=use_checkpoint,
+                            num_heads=num_heads,
+                            num_head_channels=num_head_channels,
+                            use_new_attention_order=use_new_attention_order,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(channel_mult) - 1:
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(
+                        ResBlock(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            down=True,
+                        )
+                        if resblock_updown
+                        else Downsample(
+                            ch, conv_resample, dims=dims, out_channels=out_ch
+                        )
+                    )
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                ds *= 2
+                self._feature_size += ch
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+            AttentionBlock(
+                ch,
+                use_checkpoint=use_checkpoint,
+                num_heads=num_heads,
+                num_head_channels=num_head_channels,
+                use_new_attention_order=use_new_attention_order,
+            ),
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+            for i in range(num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    ResBlock(
+                        ch + ich,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=int(model_channels * mult),
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                ch = int(model_channels * mult)
+                if ds in attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            use_checkpoint=use_checkpoint,
+                            num_heads=num_heads_upsample,
+                            num_head_channels=num_head_channels,
+                            use_new_attention_order=use_new_attention_order,
+                        )
+                    )
+                if level and i == num_res_blocks:
+                    out_ch = ch
+                    layers.append(
+                        ResBlock(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            up=True,
+                        )
+                        if resblock_updown
+                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+                    )
+                    ds //= 2
+                self.output_blocks.append(TimestepEmbedSequential(*layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            normalization(ch),
+            nn.SiLU(),
+            zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
+        )
+
+    def convert_to_fp16(self):
+        self.input_blocks.apply(convert_module_to_f16)
+        self.middle_block.apply(convert_module_to_f16)
+        self.output_blocks.apply(convert_module_to_f16)
+
+    def convert_to_fp32(self):
+        self.input_blocks.apply(convert_module_to_f32)
+        self.middle_block.apply(convert_module_to_f32)
+        self.output_blocks.apply(convert_module_to_f32)
+
+    def forward(self, x, timesteps, y=None):
+        """
+        Apply the model to an input batch.
+        :param x: an [N x C x ...] Tensor of inputs.
+        :param timesteps: a 1-D batch of timesteps.
+        :param y: an [N] Tensor of labels, if class-conditional.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
+        hs = []
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        h = x.type(self.dtype)
+        for module in self.input_blocks:
+            h = module(h, emb)
+            hs.append(h)
+        h = self.middle_block(h, emb)
+        for module in self.output_blocks:
+            h = th.cat([h, hs.pop()], dim=1)
+            h = module(h, emb)
+        h = h.type(x.dtype)
+        return self.out(h)
+
+
+============================== CELL 21 (CODE) ==============================
+def create_model(
+    image_size,
+    num_channels,
+    num_res_blocks,
+    channel_mult="",
+    learn_sigma=False,
+    class_cond=False,
+    use_checkpoint=False,
+    attention_resolutions="16",
+    num_heads=1,
+    num_head_channels=-1,
+    num_heads_upsample=-1,
+    use_scale_shift_norm=False,
+    dropout=0,
+    resblock_updown=False,
+    use_fp16=False,
+    use_new_attention_order=False,
+    in_channels=6,
+    out_channels=3,
+):
+    if channel_mult == "":
+        if image_size == 512:
+            channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
+        elif image_size == 256:
+            channel_mult = (1, 1, 2, 2, 4, 4)
+        elif image_size == 128:
+            channel_mult = (1, 1, 2, 3, 4)
+        elif image_size == 64:
+            channel_mult = (1, 2, 3, 4)
+        else:
+            raise ValueError(f"unsupported image size: {image_size}")
+    else:
+        channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
+
+    attention_ds = []
+    for res in attention_resolutions.split(","):
+        attention_ds.append(image_size // int(res))
+
+    return UNetModel(
+        image_size=image_size,
+        in_channels=in_channels,
+        model_channels=num_channels,
+        out_channels=(1 * out_channels if not learn_sigma else 2 * out_channels),
+        num_res_blocks=num_res_blocks,
+        attention_resolutions=tuple(attention_ds),
+        dropout=dropout,
+        channel_mult=channel_mult,
+        num_classes=(NUM_CLASSES if class_cond else None),
+        use_checkpoint=use_checkpoint,
+        use_fp16=use_fp16,
+        num_heads=num_heads,
+        num_head_channels=num_head_channels,
+        num_heads_upsample=num_heads_upsample,
+        use_scale_shift_norm=use_scale_shift_norm,
+        resblock_updown=resblock_updown,
+        use_new_attention_order=use_new_attention_order,
+    )
+
+
+============================== CELL 22 (MARKDOWN) ==============================
+### D 2. Forward diffusion và reverse diffusion
+Ở training, chọn một timestep`t` rồi thêm nhiễu:
+
+$$x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon.$$
+
+U-Net học dự đoán epsilon; loss gốc là meanL 1. Sampling bắt đầu từ Gaussian noise và chạy ngược 250 bước. Một optimizer update không tương đương một lần sinh ảnh 250 bước.
+
+
+============================== CELL 23 (CODE) ==============================
+def cosine_beta_schedule(timesteps, s=0.008):
+    steps = timesteps + 1
+    x = np.linspace(0, steps, steps)
+    alphas_cumprod = np.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return np.clip(betas, a_min=0, a_max=0.999)
+
+
+============================== CELL 24 (CODE) ==============================
+class GaussianDiffusion(nn.Module):
+    def __init__(
+        self,
+        denoise_fn,
+        *,
+        image_size,
+        channels=3,
+        timesteps=1000,
+        loss_type="l1",
+        betas=None,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.image_size = image_size
+        self.denoise_fn = denoise_fn
+
+        if exists(betas):
+            betas = (
+                betas.detach().cpu().numpy()
+                if isinstance(betas, torch.Tensor)
+                else betas
+            )
+        else:
+            betas = cosine_beta_schedule(timesteps)
+
+        alphas = 1.0 - betas
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
+
+        (timesteps,) = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.loss_type = loss_type
+
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+
+        self.register_buffer("betas", to_torch(betas))
+        self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
+        self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer(
+            "sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod))
+        )
+        self.register_buffer(
+            "log_one_minus_alphas_cumprod", to_torch(np.log(1.0 - alphas_cumprod))
+        )
+        self.register_buffer(
+            "sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod))
+        )
+        self.register_buffer(
+            "sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1))
+        )
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = (
+            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+        self.register_buffer("posterior_variance", to_torch(posterior_variance))
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.register_buffer(
+            "posterior_log_variance_clipped",
+            to_torch(np.log(np.maximum(posterior_variance, 1e-20))),
+        )
+        self.register_buffer(
+            "posterior_mean_coef1",
+            to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)),
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            to_torch(
+                (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)
+            ),
+        )
+
+    def q_mean_variance(self, x_start, t):
+        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        variance = extract(1.0 - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        return mean, variance, log_variance
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior(self, x_start, x_t, t, c=None):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(
+            self.posterior_log_variance_clipped, t, x_t.shape
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, x, t, clip_denoised: bool, c=None):
+        x_recon = self.predict_start_from_noise(
+            x, t=t, noise=self.denoise_fn(torch.cat([x, c], 1), t)
+        )
+
+        if clip_denoised:
+            x_recon.clamp_(-1.0, 1.0)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+            x_start=x_recon, x_t=x, t=t, c=c
+        )
+        return model_mean, posterior_variance, posterior_log_variance
+
+    @torch.no_grad()
+    def p_sample(
+        self, x, t, condition_tensors=None, clip_denoised=True, repeat_noise=False
+    ):
+        b, *_, device = *x.shape, x.device
+        model_mean, _, model_log_variance = self.p_mean_variance(
+            x=x, t=t, c=condition_tensors, clip_denoised=clip_denoised
+        )
+        noise = noise_like(x.shape, device, repeat_noise)
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape, condition_tensors=None):
+        device = self.betas.device
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        # Looping through timesteps in reverse order
+        for i in tqdm(
+            reversed(range(self.num_timesteps)),
+            desc="sampling loop time step",
+            total=self.num_timesteps,
+        ):
+            t = torch.full((b,), i, device=device, dtype=torch.long)
+            img = self.p_sample(img, t, condition_tensors=condition_tensors)
+
+        return img
+
+    @torch.no_grad()
+    def sample(self, batch_size=16, condition_tensors=None):
+        image_size = self.image_size
+        channels = self.channels
+
+        return self.p_sample_loop(
+            (batch_size, channels, image_size, image_size),
+            condition_tensors=condition_tensors,
+        )
+
+    @torch.no_grad()
+    def interpolate(self, x1, x2, t=None, lam=0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+        for i in tqdm(
+            reversed(range(0, t)), desc="interpolation sample time step", total=t
+        ):
+            img = self.p_sample(
+                img, torch.full((b,), i, device=device, dtype=torch.long)
+            )
+
+        return img
+
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def p_losses(self, x_start, t, condition_tensors=None, noise=None):
+        b, c, h, w = x_start.shape
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_recon = self.denoise_fn(torch.cat([x_noisy, condition_tensors], 1), t)
+
+        if self.loss_type == "l1":
+            loss = (noise - x_recon).abs().mean()
+        elif self.loss_type == "l2":
+            loss = F.mse_loss(x_recon, noise)
+        else:
+            raise NotImplementedError()
+
+        return loss
+
+    def forward(self, x, condition_tensors=None, *args, **kwargs):
+        (
+            b,
+            c,
+            h,
+            w,
+            device,
+            img_size,
+        ) = (
+            *x.shape,
+            x.device,
+            self.image_size,
+        )
+        assert (
+            h == img_size and w == img_size
+        ), f"height and width of image must be {img_size}"
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self.p_losses(x, t, condition_tensors=condition_tensors, *args, **kwargs)
+
+
+============================== CELL 25 (CODE) ==============================
+@torch.no_grad()
+def full_reverse(diff, condition, seed, trace=False):
+    """One full 250-step trajectory with its own RNG scope; [0,1] RGB out."""
+    diff.eval()
+    device = condition.device
+    frames = []
+    with fixed_seed(seed, device):
+        x = torch.randn(condition.shape, device=device)
+        if trace:
+            frames.append((x[0].cpu(), "initial Gaussian noise"))
+        for timestep in reversed(range(diff.num_timesteps)):
+            t = torch.full((len(x),), timestep, device=device, dtype=torch.long)
+            x = diff.p_sample(x, t, condition_tensors=condition)
+            if trace and timestep in [199, 149, 99, 49, 0]:
+                frames.append((x[0].cpu(), f"after t={timestep}"))
+    return (x + 1).div(2).clamp(0, 1), frames
+
+
+============================== CELL 26 (MARKDOWN) ==============================
+### D 3. Kiểm tra kiến trúc và minh họa nhiễu
+Đo số tham số, kiểm shape qua forward thật và vẽ noisy versions của **ảnh thật**. Đây chưa phải gallery ảnh sinh cuối.
+
+
+============================== CELL 27 (CODE) ==============================
+report.base.architecture()
+
+--- OUTPUTS (5) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:                               model  parameters  input_channels  \ 0  Mask-conditioned denoising U-Net    28448963               6        output_channels  diffusion_steps            space   0         
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain:          block             output 0    encoder.0  (1, 64, 256, 256) 1    encoder.1  (1, 64, 256, 256) 2    encoder.2  (1, 64, 256, 256) 3    encoder.3  (1, 64, 128, 128) 4    encoder.4  (1, 64, 128, 1
+  [out 2: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 3: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 4: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 28 (MARKDOWN) ==============================
+Ở timestep lớn, cấu trúc ảnh bị nhiễu che lấp. Loss giảm chỉ chứng minh khớp mục tiêu dự đoán nhiễu tốt hơn; không tự bảo đảm màu/texture hoặc downstream tốt hơn.
+
+
+============================== CELL 29 (MARKDOWN) ==============================
+## E. Huấn luyện DDPM ban đầu
+### E 1. Recipe và checkpoint
+Adam `1e-4`, clipgrad 1, EMA `0.995`, loss L1, schedule 250. Trên T4 × 2:4 ảnh/GPU× 2 GPU×accumulation 4 = 32 ảnh/update. 
+Kế hoạch ban đầu là 10 k.
+
+
+
+============================== CELL 30 (CODE) ==============================
+def checkpoint_own(cfg, diff, ema, opt, step, history, rank, world, device):
+    value = rng_state(device)
+    states = [None] * world
+    if world > 1:
+        dist.all_gather_object(states, value)
+    else:
+        states = [value]
+    if rank == 0:
+        save_pt(
+            Path(cfg["out"]) / "own/checkpoints/last.pt",
+            {
+                "protocol": cfg["protocol"],
+                "model": diff.state_dict(),
+                "ema": ema.state_dict(),
+                "optimizer": opt.state_dict(),
+                "step": step,
+                "history": history,
+                "rng_by_rank": states,
+                "world_size": world,
+                "origin": "Own DDPM from scratch; report-master rebuild",
+            },
+        )
+        write_json(Path(cfg["out"]) / "own/history.json", history)
+    if world > 1:
+        dist.barrier()
+
+
+============================== CELL 31 (CODE) ==============================
+def train_own(cfg):
+    rank, world, device = runtime(cfg, True)
+    records = {r["id"]: r for r in cfg["records"]}
+    diff = factory(cfg, device)
+    ema = copy.deepcopy(diff).eval().requires_grad_(False)
+    net = (
+        DDP(
+            diff.denoise_fn,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            broadcast_buffers=False,
+        )
+        if world > 1
+        else diff.denoise_fn
+    )
+    # DDP broadcasts the randomly initialized network from rank0; EMA must match it.
+    ema.load_state_dict(diff.state_dict())
+    opt = torch.optim.Adam(net.parameters(), lr=cfg["own_lr"])
+    path = Path(cfg["out"]) / "own/checkpoints/last.pt"
+    step = 0
+    history = []
+    if path.exists():
+        cp = load_pt(path)
+        if cp["protocol"] != cfg["protocol"] or cp["world_size"] != world:
+            raise ValueError("Wrong own-training resume")
+        diff.load_state_dict(cp["model"])
+        ema.load_state_dict(cp["ema"])
+        opt.load_state_dict(cp["optimizer"])
+        step, history = cp["step"], cp["history"]
+        restore_rng(cp["rng_by_rank"][rank], device)
+        del cp
+    loaded = step
+    if not path.exists():
+        checkpoint_own(cfg, diff, ema, opt, step, history, rank, world, device)
+    batch = cfg["own_per_gpu_batch"]
+    acc = cfg["own_accumulation"]
+    while step < cfg["own_steps"]:
+        if resource_stop(cfg, device, True):
+            break
+        tick = time.monotonic()
+        net.train()
+        opt.zero_grad(set_to_none=True)
+        loss_value = 0.0
+        for micro in range(acc):
+            positions = [
+                step * batch * world * acc + micro * batch * world + rank * batch + j
+                for j in range(batch)
+            ]
+            ids = stream_ids(cfg["train_ids"], positions, cfg["seed"])
+            rows = [
+                tensor_pair(records[sid], cfg["size"], cfg["seed"] + pos)
+                for sid, pos in zip(ids, positions)
+            ]
+            clean = torch.stack([x for x, y in rows]).to(device) * 2 - 1
+            condition = (
+                torch.stack([y.repeat(3, 1, 1) for x, y in rows]).to(device) * 2 - 1
+            )
+            scope = (
+                net.no_sync()
+                if world > 1 and micro < acc - 1
+                else contextlib.nullcontext()
+            )
+            with scope:
+                t = torch.randint(0, 250, (len(clean),), device=device)
+                noise = torch.randn_like(clean)
+                noisy = diff.q_sample(clean, t, noise)
+                eps = net(torch.cat([noisy, condition], 1), t)
+                loss = (eps - noise).abs().mean()
+                invalid = torch.tensor(int(not torch.isfinite(loss)), device=device)
+                if world > 1:
+                    dist.all_reduce(invalid)
+                if invalid.item():
+                    raise RuntimeError("Nonfinite DDPM loss")
+                (loss / acc).backward()
+                loss_value += float(loss.detach()) / acc
+            del clean, condition, noise, noisy, eps, loss, t
+        norm = torch.nn.utils.clip_grad_norm_(
+            net.parameters(), 1.0, error_if_nonfinite=True
+        )
+        opt.step()
+        with torch.no_grad():
+            for a, b in zip(ema.parameters(), diff.parameters()):
+                a.mul_(0.995).add_(b, alpha=0.005)
+            for a, b in zip(ema.buffers(), diff.buffers()):
+                a.copy_(b)
+        if world > 1:
+            value = torch.tensor(loss_value, device=device)
+            dist.all_reduce(value)
+            loss_value = float(value / world)
+        step += 1
+        history.append(
+            {
+                "step": step,
+                "loss": loss_value,
+                "grad_norm": float(norm),
+                "seconds": time.monotonic() - tick,
+            }
+        )
+        if step % 25 == 0:
+            print(
+                f'OWN rank{rank}: {step}/{cfg["own_steps"]}, loss={loss_value:.5f}',
+                flush=True,
+            )
+        if step % cfg["save_every"] == 0 or step == cfg["own_steps"]:
+            checkpoint_own(cfg, diff, ema, opt, step, history, rank, world, device)
+    if step != loaded:
+        checkpoint_own(cfg, diff, ema, opt, step, history, rank, world, device)
+    if rank == 0:
+        write_json(
+            Path(cfg["out"]) / "own/status.json",
+            {
+                "step": step,
+                "complete": step == cfg["own_steps"],
+                "protocol": cfg["protocol"],
+                "additional_updates_this_launch": step - loaded,
+            },
+        )
+    telemetry(
+        cfg,
+        "own_train",
+        rank,
+        device,
+        step=step,
+        full_state_sha256=state_fingerprint(diff.state_dict()),
+    )
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+============================== CELL 32 (MARKDOWN) ==============================
+### E 2. Chạy hiển thị đầy đủ tiến độ
+
+
+
+============================== CELL 33 (CODE) ==============================
+EXPERIMENT_READY = True
+if ACTION == "REBUILD":
+    if not resource_stop(RUN):
+        launch(RUN, "own")
+    status_file = Path(OUTPUT_DIR) / "own/status.json"
+    EXPERIMENT_READY = status_file.exists() and json.loads(status_file.read_text())["complete"]
+
+
+============================== CELL 34 (CODE) ==============================
+own_history, own_history_status = read_history('own')
+display(own_history_status)
+save_table(own_history_status, "own_status_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:   Giai đoạn  Update LAST của stage  Bản ghi log Tổng refiner LAST  Trạng thái 0       own                   8825         8825              None  Có dữ kiện
+
+
+============================== CELL 35 (CODE) ==============================
+if not own_history.empty:
+    metrics = [key for key in ['loss', 'epsilon_L1', 'LPIPS', 'restoration_RGB_L1'] if key in own_history]
+    if metrics:
+        fig, axes = plt.subplots(1, min(3,len(metrics)), figsize=(14,3.2), squeeze=False)
+        for ax, metric in zip(axes.flat, metrics[:3]):
+            ax.plot(own_history.step, own_history[metric], alpha=0.22, linewidth=0.7)
+            ax.plot(own_history.step, own_history[metric].rolling(50,min_periods=1).mean(), linewidth=1.5)
+            ax.set(xlabel="Optimizer update của stage", ylabel=metric)
+        save_figure(fig, "own_loss_v41.png", "Huấn luyện")
+        show_inline(fig)
+        plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 36 (CODE) ==============================
+if not own_history.empty and 'data_pass_equivalent' in own_history:
+    log = own_history.copy()
+    log['pass_bin'] = np.floor(log.data_pass_equivalent).astype(int)
+    loss_key = 'loss' if 'loss' in log else 'epsilon_L1'
+    passes = log.groupby('pass_bin').agg(update_first=('step','min'), update_last=('step','max'), records=('step','size'), mean_loss=(loss_key,'mean')).reset_index()
+    from IPython.display import HTML
+    display(HTML('<div style="max-height:420px;overflow:auto">'+passes.to_html(index=False)+'</div>'))
+    save_table(log, "own_updates_full_v41.csv", "Huấn luyện")
+    save_table(passes, "own_passes_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 37 (MARKDOWN) ==============================
+### E3. Ảnh sinh của DDPM 10k
+
+
+============================== CELL 38 (CODE) ==============================
+own_gallery = intermediate_rows('own', limit=N_CASES, ids=DISPLAY_IDS)
+display(own_gallery[[c for c in ['id','stage','actual_updates','method'] if c in own_gallery]]
+        if not own_gallery.empty else pd.DataFrame([{'Giai đoạn': 'own', 'Trạng thái':'Chưa có PNG tương ứng trong nguồn đã attach'}]))
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:                           id     stage  actual_updates    method 0  cju0qkwl35piu0993l0dewei2  DDPM RAW            8825  analytic 1  cju0qx73cjw570799j4n5cjze  DDPM RAW            8825  analytic 2  cj
+
+
+============================== CELL 39 (CODE) ==============================
+if not own_gallery.empty:
+    fig, axes = plt.subplots(len(own_gallery), 3, figsize=(10.2, 3.3*len(own_gallery)), squeeze=False)
+    for row_index, row in own_gallery.iterrows():
+        columns = [('mask','Mask'), ('real','Ảnh thật'), ('image', f"DDPM RAW · {row['actual_updates']} updates")]
+        for ax, (key,title) in zip(axes[row_index], columns):
+            image = Image.open(row[key]).convert('L' if key=='mask' else 'RGB')
+            ax.imshow(image, cmap='gray' if key=='mask' else None)
+            ax.set_title(title, fontsize=10)
+            ax.axis('off')
+    save_figure(fig, "own_gallery.png", "Kết quả trung gian")
+    show_inline(fig)
+    plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 40 (MARKDOWN) ==============================
+## F. Hiệu chỉnh màu
+### F 1. Vấn đề và hai phương án
+Màu xanh/tím hoặc vàng quá mức xuất hiện ở một số output ban đầu. Một mask chỉ cho biết vị trí polyp, không quy định palette toàn ảnh.
+
+1. **Analytic Lab projection:** điều chỉnh mean/std Lab theo palette train, có giới hạn gain.
+2. **PaletteLUT:** học residual màu có chặn; so với analytic trên validation corrector.
+
+
+
+============================== CELL 41 (CODE) ==============================
+def palette_projection(x, palette, gain_limit=3.0):
+    support = tissue_support(x)
+    source = lab_moments(x, support)
+    lab = rgb_to_lab(x)
+    floor = x.new_tensor([0.035, 0.015, 0.015])[None]
+    src_std = torch.maximum(source[:, 3:], floor)
+    target_std = torch.maximum(palette[:, 3:], floor)
+    scale = (target_std / src_std).clamp(1 / gain_limit, gain_limit)
+    corrected = (lab - source[:, :3, None, None]) * scale[:, :, None, None] + palette[
+        :, :3, None, None
+    ]
+    # Preserve deep shadows continuously; no threshold-based hole cutting/FOV segmentation.
+    lightness = torch.minimum(corrected[:, :1], lab[:, :1].clamp_min(0) * 3.0)
+    corrected = torch.cat([lightness, corrected[:, 1:]], dim=1)
+    raw = lab_to_rgb(corrected, clip=False)
+    result = raw.clamp(0, 1)
+    # Keep existing black borders and pure white highlights at the same locations.
+    preserve = (x.amax(1, keepdim=True) <= 0.025) | (x.amin(1, keepdim=True) >= 0.995)
+    result = torch.where(preserve, x, result)
+    penalty_mask = (~preserve).float()
+    excess = ((F.relu(-raw) + F.relu(raw - 1)) * penalty_mask).sum() / (
+        penalty_mask.sum() * 3
+    ).clamp_min(1)
+    return result, excess
+
+
+============================== CELL 42 (CODE) ==============================
+class PaletteLUT(nn.Module):
+    def __init__(self, dim=17, bases=3):
+        super().__init__()
+        self.dim, self.bases = dim, bases
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 16, 3, 2, 1),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, 3, 2, 1),
+            nn.SiLU(),
+            nn.Conv2d(32, 48, 3, 2, 1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(48 + 6, 48), nn.SiLU(), nn.Linear(48, bases)
+        )
+        nn.init.zeros_(self.predictor[-1].weight)
+        nn.init.zeros_(self.predictor[-1].bias)
+        values = torch.randn(bases, 3, dim, dim, dim) * 0.002
+        values -= values.mean(0, keepdim=True)
+        self.residuals = nn.Parameter(values)
+        self.register_buffer("identity", identity_lut(dim))
+
+    def forward(self, x, palette, project=True):
+        features = self.encoder(
+            F.interpolate(x, size=(64, 64), mode="bilinear", align_corners=False)
+        ).flatten(1)
+        weights = self.predictor(torch.cat([features, palette], 1)).softmax(1)
+        tables = self.identity[None] + 0.75 * self.residuals.tanh()
+        lut = torch.einsum("bm,mcijk->bcijk", weights, tables)
+        raw = apply_lut(x, lut)
+        clip_penalty = (F.relu(-raw) + F.relu(raw - 1)).mean()
+        rendered = raw.clamp(0, 1)
+        if project:
+            rendered, gamut = palette_projection(rendered, palette)
+            clip_penalty = clip_penalty + gamut
+            baseline, _ = palette_projection(x, palette)
+            # Learned increment is bounded to avoid large new chromatic speckles.
+            rendered = baseline + 0.04 * torch.tanh((rendered - baseline) / 0.04)
+            rendered = rendered.clamp(0, 1)
+            preserve = (x.amax(1, keepdim=True) <= 0.025) | (
+                x.amin(1, keepdim=True) >= 0.995
+            )
+            rendered = torch.where(preserve, x, rendered)
+        return rendered, clip_penalty
+
+    def regularization(self):
+        tables = self.identity[None] + 0.75 * self.residuals.tanh()
+        tv = sum((self.residuals.diff(dim=axis) ** 2).mean() for axis in [2, 3, 4])
+        # Monotonicity in the corresponding color axis; cross-channel mixing is allowed.
+        mono = F.relu(-tables[:, 0].diff(dim=3)).mean()
+        mono += F.relu(-tables[:, 1].diff(dim=2)).mean()
+        mono += F.relu(-tables[:, 2].diff(dim=1)).mean()
+        return tv, mono
+
+
+============================== CELL 43 (MARKDOWN) ==============================
+### F 2. Loss màu có training
+Paired reconstruction giữ nội dung trên cặp ảnh thật–ảnh bị biến đổi màu; SWD điều chỉnh phân bố palette; gradient và regularization hạn chế thay cấu trúc. Teacher chỉ cung cấp tham chiếu màu trong nhánh calibration, không chép hình học vào output.
+
+
+============================== CELL 44 (CODE) ==============================
+def color_objective(corrector, noisy, clean, style, raw, teacher, teacher_style):
+    repaired, gamut1 = corrector(noisy, style)
+    corrected, gamut2 = corrector(raw, teacher_style)
+    paired = (
+        (repaired - clean).abs().mean()
+        + 0.2 * (rgb_to_lab(repaired) - rgb_to_lab(clean)).abs().mean()
+        + 0.1 * gradient_match(repaired, clean)
+    )
+    distribution = palette_swd(corrected, teacher)
+    structure = gradient_match(normalized_luma(corrected), normalized_luma(raw))
+    analytic, _ = palette_projection(raw, teacher_style)
+    chroma_structure = gradient_match(rgb_to_lab(corrected), rgb_to_lab(analytic))
+    tv, mono = corrector.regularization()
+    loss = (
+        paired
+        + 0.5 * distribution
+        + 0.01 * structure
+        + 0.05 * chroma_structure
+        + 0.01 * (gamut1 + gamut2)
+        + 1e-3 * tv
+        + 1e-3 * mono
+    )
+    return loss, {"paired": paired, "palette_swd": distribution, "structure": structure}
+
+
+============================== CELL 45 (CODE) ==============================
+%%implementation color_stage
+def train_color():
+    global CORRECTOR, COLOR_COMPLETE
+    COLOR_COMPLETE = False
+    seed_all(CFG["seed"] + 1400)
+    CORRECTOR = PaletteLUT(CFG["lut_dim"]).to(DEVICE)
+    opt = torch.optim.Adam(CORRECTOR.parameters(), lr=CFG["color_lr"])
+    step, history, best = 0, [], float("inf")
+    path = OUT / "color/checkpoints/last.pt"
+    cache_fingerprint = color_cache_fingerprint()
+    if path.exists():
+        cp = load_pt(path)
+        if cp["protocol"] != LOCK_ID:
+            raise ValueError("Color checkpoint protocol mismatch")
+        if cp.get("cache_fingerprint") != cache_fingerprint:
+            raise ValueError("Color training cache changed since checkpoint")
+        CORRECTOR.load_state_dict(cp["model"])
+        opt.load_state_dict(cp["optimizer"])
+        step, history, best = cp["step"], cp["history"], cp["best_score"]
+        set_rng(cp["rng"])
+        del cp
+    loaded_step = step
+    if MODE == "REPORT_DEMO" and step < CFG["color_steps"]:
+        raise RuntimeError("REPORT_DEMO requires completed color training")
+    print(
+        "Color calibration updates:",
+        step,
+        "->",
+        CFG["color_steps"],
+        "; own DDPM retained at",
+        GENERATOR_ORIGIN["source_step"],
+    )
+    while step < CFG["color_steps"]:
+        if left() < 180:
+            break
+        tick = time.monotonic()
+        CORRECTOR.train()
+        noisy, clean, style, raw, teacher, teacher_style = color_train_batch(step)
+        opt.zero_grad(set_to_none=True)
+        loss, parts = color_objective(
+            CORRECTOR, noisy, clean, style, raw, teacher, teacher_style
+        )
+        paired, distribution, structure = (
+            parts["paired"],
+            parts["palette_swd"],
+            parts["structure"],
+        )
+        if not torch.isfinite(loss):
+            raise RuntimeError("Nonfinite color loss")
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(
+            CORRECTOR.parameters(), 5.0, error_if_nonfinite=True
+        )
+        opt.step()
+        step += 1
+        history.append(
+            {
+                "step": step,
+                "loss": float(loss.detach()),
+                "paired": float(paired.detach()),
+                "palette_swd": float(distribution.detach()),
+                "structure": float(structure.detach()),
+                "seconds": time.monotonic() - tick,
+                "grad_norm": float(norm),
+            }
+        )
+        del (
+            noisy,
+            clean,
+            style,
+            raw,
+            teacher,
+            teacher_style,
+            loss,
+            paired,
+            distribution,
+            structure,
+            norm,
+            parts,
+        )
+        if step % 50 == 0:
+            print("Color train", step, "/", CFG["color_steps"], history[-1], flush=True)
+        if step % CFG["color_validate_every"] == 0 or step == CFG["color_steps"]:
+            score, paired_df, unpaired_df = validate_color(CORRECTOR)
+            history[-1]["validation_score"] = score
+            if score < best:
+                best = score
+                save_pt(
+                    OUT / "color/checkpoints/best.pt",
+                    {
+                        "protocol": LOCK_ID,
+                        "model": CORRECTOR.state_dict(),
+                        "step": step,
+                        "validation_score": score,
+                        "cache_fingerprint": cache_fingerprint,
+                    },
+                )
+            paired_df.to_csv(
+                OUT / "tables/color_validation_paired_latest.csv", index=False
+            )
+            unpaired_df.to_csv(
+                OUT / "tables/color_validation_unpaired_latest.csv", index=False
+            )
+        if step % CFG["color_save_every"] == 0 or step == CFG["color_steps"]:
+            save_color_state(CORRECTOR, opt, step, history, best)
+        if step % CFG.get("memory_every", 25) == 0 and memory_watch(
+            step, "color_training"
+        ):
+            print("Color checkpoint saved at host-memory guard")
+            break
+    if step > loaded_step:
+        save_color_state(CORRECTOR, opt, step, history, best)
+    import pandas as pd
+
+    pd.DataFrame(history).to_csv(OUT / "tables/color_training_history.csv", index=False)
+    if history:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3))
+        axes[0].plot([r["step"] for r in history], [r["loss"] for r in history])
+        axes[0].set_title("Actual color-module training loss")
+        val = [r for r in history if "validation_score" in r]
+        axes[1].plot(
+            [r["step"] for r in val], [r["validation_score"] for r in val], marker="o"
+        )
+        axes[1].set_title("Held-out color-corrector selection, no Test100")
+        fig_save(fig, "color_01_training.png")
+    COLOR_COMPLETE = step == CFG["color_steps"]
+    if COLOR_COMPLETE:
+        cp = load_pt(OUT / "color/checkpoints/best.pt")
+        if (
+            cp["protocol"] != LOCK_ID
+            or cp.get("cache_fingerprint") != cache_fingerprint
+        ):
+            raise ValueError("Best color checkpoint source/cache mismatch")
+        CORRECTOR.load_state_dict(cp["model"])
+        del cp
+        CORRECTOR.eval().requires_grad_(False)
+    del opt
+    release_unused_memory(True)
+    return COLOR_COMPLETE
+
+
+============================== CELL 46 (MARKDOWN) ==============================
+### F 3. Tiến hành training chỉnh màu
+
+
+============================== CELL 47 (CODE) ==============================
+if not resource_stop(RUN):
+    launch(RUN, "color", worker="color_stage.py")
+color_status = Path(OUTPUT_DIR) / "experimental_color/summary.json"
+EXPERIMENT_READY = color_status.exists() and json.loads(color_status.read_text())["complete"]
+
+
+============================== CELL 48 (CODE) ==============================
+color_history, color_history_status = read_history('color')
+display(color_history_status)
+save_table(color_history_status, "color_status_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:   Giai đoạn  Update LAST của stage  Bản ghi log Tổng refiner LAST  Trạng thái 0     color                   2000         2000              None  Có dữ kiện
+
+
+============================== CELL 49 (CODE) ==============================
+if not color_history.empty:
+    metrics = [key for key in ['loss', 'epsilon_L1', 'LPIPS', 'restoration_RGB_L1'] if key in color_history]
+    if metrics:
+        fig, axes = plt.subplots(1, min(3,len(metrics)), figsize=(14,3.2), squeeze=False)
+        for ax, metric in zip(axes.flat, metrics[:3]):
+            ax.plot(color_history.step, color_history[metric], alpha=0.22, linewidth=0.7)
+            ax.plot(color_history.step, color_history[metric].rolling(50,min_periods=1).mean(), linewidth=1.5)
+            ax.set(xlabel="Optimizer update của stage", ylabel=metric)
+        save_figure(fig, "color_loss_v41.png", "Huấn luyện")
+        show_inline(fig)
+        plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 50 (CODE) ==============================
+if not color_history.empty and 'data_pass_equivalent' in color_history:
+    log = color_history.copy()
+    log['pass_bin'] = np.floor(log.data_pass_equivalent).astype(int)
+    loss_key = 'loss' if 'loss' in log else 'epsilon_L1'
+    passes = log.groupby('pass_bin').agg(update_first=('step','min'), update_last=('step','max'), records=('step','size'), mean_loss=(loss_key,'mean')).reset_index()
+    from IPython.display import HTML
+    display(HTML('<div style="max-height:420px;overflow:auto">'+passes.to_html(index=False)+'</div>'))
+    save_table(log, "color_updates_full_v41.csv", "Huấn luyện")
+    save_table(passes, "color_passes_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 51 (CODE) ==============================
+report.historical_decision("color")
+
+--- OUTPUTS (3) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 2: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 52 (MARKDOWN) ==============================
+### F4. Ảnh trước và sau sửa màu
+
+
+============================== CELL 53 (CODE) ==============================
+color_root = report.stage_root("color")
+if color_root is None or not (color_root / "color/raw_bank").is_dir():
+    color_root = Path(
+        "/kaggle/input/notebooks/thnhvinhs/polyp-ddpm-master-end-to-end-3/"
+        "polyp_ddpm_trained_color_repair_v141"
+    )
+
+raw_images = {p.stem:p for p in (color_root/"color/raw_bank").glob("*.png")}
+fixed_images = {p.stem:p for p in (color_root/"synthetic/images").glob("*.png")}
+record_map = {r["id"]:r for r in RUN["records"]}
+case_ids = sorted(raw_images.keys() & fixed_images.keys() & record_map.keys())
+if DISPLAY_IDS is not None:
+    case_ids = [sid for sid in DISPLAY_IDS if sid in case_ids]
+case_ids = case_ids[:N_CASES]
+if not case_ids:
+    raise FileNotFoundError("Không có ID chung giữa RAW, ảnh sửa màu và dữ liệu hiện tại.")
+
+manifest_path = color_root/"synthetic/manifest.json"
+manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+metadata = {r["id"]:r for r in manifest.get("images",[])}
+origin = manifest.get("generator_origin",{})
+if not origin:
+    origin = json.loads((color_root/"protocol.json").read_text())["protocol"].get("generator_origin",{})
+rows = []
+for sid in case_ids:
+    row = metadata.get(sid,{})
+    if row.get("raw_sha256") and digest(raw_images[sid]) != row["raw_sha256"]:
+        raise ValueError("RAW PNG khác manifest: "+sid)
+    if row.get("sha256") and digest(fixed_images[sid]) != row["sha256"]:
+        raise ValueError("PNG sau sửa màu khác manifest: "+sid)
+    rows.append({"id":sid,"stage":"Sau sửa màu","image":str(fixed_images[sid]),
+                 "source":str(raw_images[sid]),"real":record_map[sid]["image"],
+                 "mask":record_map[sid]["mask"],"actual_updates":origin.get("source_step"),
+                 "method":row.get("method",manifest.get("method",""))})
+color_gallery = pd.DataFrame(rows)
+
+
+============================== CELL 54 (CODE) ==============================
+if not color_gallery.empty:
+    fig, axes = plt.subplots(len(color_gallery), 3, figsize=(10.2, 3.3*len(color_gallery)), squeeze=False)
+    for row_index, row in color_gallery.iterrows():
+        columns = [('real','Ảnh thật'), ('source','Trước sửa màu'), ('image', 'Sau sửa màu · '+str(row['method']))]
+        for ax, (key,title) in zip(axes[row_index], columns):
+            image = Image.open(row[key]).convert('L' if key=='mask' else 'RGB')
+            ax.imshow(image, cmap='gray' if key=='mask' else None)
+            ax.set_title(title, fontsize=10)
+            ax.axis('off')
+    save_figure(fig, "color_gallery.png", "Kết quả trung gian")
+    show_inline(fig)
+    plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 55 (MARKDOWN) ==============================
+## G. Hiệu chỉnh texture, nền và bảo vệ biên
+### G 1. Chuyển từ sửa màu sang restoration
+Sau khi palette ổn định, vấn đề còn lại là nền/niêm mạc mờ hoặc lốm đốm. Refiner học restoration trên ảnh thật đã làm suy giảm; inference nhận ảnh sau sửa màu, thêm nhiễu có kiểm soát rồi tái tạo một phần.
+
+Đề xuất giảm neo nền để giải phóng chi tiết. Thêm bảo vệ vùng polyp/dải biên và prior để hạn chế biến dạng. Refiner là model riêng có nguồn khởi tạo pretrained.
+
+
+============================== CELL 56 (CODE) ==============================
+def degrade_real(clean, condition, seed):
+    """
+    Paired blur+grain simulation, especially background. No geometry warp or color shift.
+    This small original degradation model is inspired by restoration training, not BSRGAN reproduction.
+    """
+    gen = torch.Generator(device=clean.device).manual_seed(int(seed))
+    result = []
+    rgb = (clean + 1) / 2
+    mask = ((condition[:, :1] + 1) / 2).clamp(0, 1)
+    for i in range(len(clean)):
+        sigma = 0.5 + 1.0 * float(torch.rand((), device=clean.device, generator=gen))
+        axis = torch.arange(-3, 4, device=clean.device, dtype=clean.dtype)
+        kernel = torch.exp(-axis.square() / (2 * sigma * sigma))
+        kernel /= kernel.sum()
+        k = (kernel[:, None] * kernel[None, :])[None, None].repeat(3, 1, 1, 1)
+        blur = F.conv2d(
+            F.pad(rgb[i : i + 1], (3, 3, 3, 3), mode="reflect"), k, groups=3
+        )
+        gaussian = torch.randn(rgb[i : i + 1].shape, device=clean.device, generator=gen)
+        grain = (
+            0.007 + 0.018 * float(torch.rand((), device=clean.device, generator=gen))
+        ) * gaussian
+        speckle = (
+            0.025
+            * torch.randn((1, 1, *rgb.shape[-2:]), device=clean.device, generator=gen)
+            * rgb[i : i + 1]
+        )
+        mix = (1 - 0.65 * mask[i : i + 1]) * tissue_support(rgb[i : i + 1])
+        # Preserve genuine black pixels; no claim that simulated artifacts exactly match DDPM outputs.
+        degraded = rgb[i : i + 1] + mix * (blur + grain + speckle - rgb[i : i + 1])
+        degraded = torch.where(
+            rgb[i : i + 1].amax(1, keepdim=True) < 0.025, rgb[i : i + 1], degraded
+        )
+        result.append(degraded.clamp(0, 1))
+    return torch.cat(result) * 2 - 1
+
+
+def mixed_training_state(diff, clean, condition, t, cfg, seed):
+    gen = torch.Generator(device=clean.device).manual_seed(int(seed))
+    repair = (
+        torch.rand((len(clean), 1, 1, 1), device=clean.device, generator=gen)
+        < cfg["restoration_probability"]
+    )
+    repair = repair & (t >= cfg["restoration_t_min"])[:, None, None, None]
+    corrupted = degrade_real(clean, condition, seed + 1)
+    base = torch.where(repair, corrupted, clean)
+    noise = torch.randn(clean.shape, device=clean.device, generator=gen)
+    noisy = diff.q_sample(base, t, noise)
+    # A corrupted-real branch must NOT incorrectly use plain Gaussian noise as target.
+    alpha = extract(diff.sqrt_alphas_cumprod, t, clean.shape)
+    sigma = extract(diff.sqrt_one_minus_alphas_cumprod, t, clean.shape).clamp_min(1e-5)
+    effective_target = (noisy - alpha * clean) / sigma
+    return noisy, effective_target, repair.flatten()
+
+
+============================== CELL 57 (MARKDOWN) ==============================
+### G 2. Loss cho texture/nền/biên
+Loss gồm epsilon L1, RGB restoration, perceptualLPIPS, gradient và prior có trọng số foreground/background/boundary. Không tối ưu độ sắc đơn thuần vì nhiễu cũng có thể làm proxy sắc nét tăng.
+
+
+============================== CELL 58 (CODE) ==============================
+def protection_regions(condition, cfg):
+    mask = ((condition[:, :1] + 1) / 2).clamp(0, 1)
+    radius = cfg["guard_radius"]
+    dilated = F.max_pool2d(mask, 2 * radius + 1, 1, radius)
+    erode_radius = max(1, radius // 2)
+    eroded = -F.max_pool2d(-mask, 2 * erode_radius + 1, 1, erode_radius)
+    band = (dilated - eroded).clamp(0, 1)
+    soft = F.avg_pool2d(dilated, 9, 1, 4)
+    return mask, band, soft
+
+
+============================== CELL 59 (CODE) ==============================
+def continuation_loss(
+    diff, eps, noisy, clean, target, t, condition, per, cfg, teacher_eps=None, pure=None
+):
+    # Teacher is the frozen selected v2 refiner, not a new author initialization.
+    total, parts = v2_background_loss(
+        diff, eps, noisy, clean, target, t, condition, per, cfg, None, None
+    )
+    mask, band, _ = protection_regions(condition, cfg)
+    valid = tissue_support((clean + 1) / 2).detach()
+    band = band * valid
+    prior = eps.sum() * 0
+    if teacher_eps is not None and pure is not None and pure.any():
+        weights = 1 + cfg["prior_fg_boost"] * mask + cfg["prior_band_boost"] * band
+        prior = masked_mean((eps[pure] - teacher_eps[pure]).abs(), weights[pure]).mean()
+    pred = diff.predict_start_from_noise(noisy, t, eps).clamp(-1, 1)
+    eligible = t <= cfg["aux_t_max"]
+    boundary_rgb = eps.sum() * 0
+    boundary_grad = boundary_rgb
+    if eligible.any():
+        a, b, w = pred[eligible], clean[eligible], band[eligible]
+        boundary_rgb = masked_mean((a - b).abs(), w).mean()
+        al = rgb_to_lab((a + 1) / 2)[:, :1]
+        bl = rgb_to_lab((b + 1) / 2)[:, :1]
+        boundary_grad = region_gradient(al, bl, w).mean()
+    total = (
+        total
+        + cfg["teacher_weight"] * prior
+        + cfg["boundary_rgb_weight"] * boundary_rgb
+        + cfg["boundary_gradient_weight"] * boundary_grad
+    )
+    parts = torch.cat(
+        [parts[:3], prior[None], parts[4:], boundary_rgb[None], boundary_grad[None]]
+    )
+    return total, parts
+
+
+============================== CELL 60 (MARKDOWN) ==============================
+### G 3. Sampler và các bước cuối
+Refiner chạy reverse một phần 120 bước từ ảnh nguồn có nhiễu. Coarse anchor mạnh ở foreground, nhẹ ở background; các bước cuối giải phóng nền để tái tạo chi tiết, vẫn có mức bảo vệ tối thiểu cho polyp/biên.
+
+
+============================== CELL 61 (CODE) ==============================
+@torch.no_grad()
+def protected_reverse(diff, reference, condition, steps, seed, cfg, palette=None):
+    # Protect only coarse structure near the polyp; do not copy real-reference pixels.
+    if not 1 <= steps <= diff.num_timesteps:
+        raise ValueError("Invalid reverse steps")
+    clean = reference * 2 - 1
+    gen = torch.Generator(device=reference.device).manual_seed(int(seed))
+    noise = torch.randn(clean.shape, device=clean.device, generator=gen)
+    ts = torch.full((len(clean),), steps - 1, device=clean.device, dtype=torch.long)
+    x = diff.q_sample(clean, ts, noise)
+    mask, band, protected = protection_regions(condition, cfg)
+    side = 32 if reference.shape[-1] >= 32 else 4
+    for t in reversed(range(steps)):
+        ts = torch.full((len(x),), t, device=x.device, dtype=torch.long)
+        eps = diff.denoise_fn(torch.cat([x, condition], 1), ts)
+        x0 = diff.predict_start_from_noise(x, ts, eps).clamp(-1, 1)
+        mean, _, logvar = diff.q_posterior(x0, x, ts)
+        z = torch.randn(x.shape, device=x.device, generator=gen)
+        x = mean + (t > 0) * (0.5 * logvar).exp() * z
+        fade = max(
+            0.0,
+            (t - cfg["release_last_steps"])
+            / max(steps - 1 - cfg["release_last_steps"], 1),
+        )
+        alpha = diff.alphas_cumprod[t - 1] if t else x.new_tensor(1.0)
+        ref = alpha.sqrt() * clean + (1 - alpha).sqrt() * noise
+        coarse_delta = low_pass(ref, side) - low_pass(x, side)
+        bg_delta = low_pass(ref, cfg["low_side"]) - low_pass(x, cfg["low_side"])
+        fg_strength = (
+            fade * cfg["foreground_anchor"] + (1 - fade) * cfg["foreground_floor"]
+        )
+        guard_strength = (1 - fade) * cfg["boundary_floor"]
+        weight = (fg_strength * mask + guard_strength * band).clamp(0, 1)
+        # Background remains fully released in the last detail steps, as in v2.
+        x = (
+            x
+            + weight * coarse_delta
+            + fade * cfg["background_anchor"] * (1 - protected) * bg_delta
+        )
+    out = ((x + 1) / 2).clamp(0, 1)
+    return palette_chroma_only(
+        out, reference if palette is None else palette, cfg["chroma_strength"]
+    )
+
+
+============================== CELL 62 (MARKDOWN) ==============================
+Đọc LAST và BEST riêng. Một stage đã train 1k/2k không có nghĩa checkpoint được chọn đã hấp thụ toàn bộ số update đó. Nếu chọn `+0`, việc sampler thay đổi vẫn có thể tác động ảnh, nhưng chưa có bằng chứng riêng rằng training thêm giúp.
+
+Các ảnh texture, nền và bảo vệ biên được hiển thị tại đây. Bộ đếm LAST và BEST được ghi riêng; không coi mọi ảnh là kết quả của toàn bộ số update đã chạy.
+
+
+============================== CELL 63 (CODE) ==============================
+if not resource_stop(RUN):
+    rebuilt = refiner_run(RUN, rebuild=True)
+    EXPERIMENT_READY = rebuilt["complete"]
+else:
+    EXPERIMENT_READY = False
+
+--- OUTPUTS (6) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 2: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 3: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 4: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 5: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 64 (MARKDOWN) ==============================
+### Quá trình hiệu chỉnh nền và bảo vệ biên
+
+
+============================== CELL 65 (CODE) ==============================
+boundary_history, boundary_history_status = read_history('v21')
+display(boundary_history_status)
+save_table(boundary_history_status, "v21_status_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:   Giai đoạn  Update LAST của stage  Bản ghi log  Tổng refiner LAST  Trạng thái 0       v21                   2000         2000               3000  Có dữ kiện
+
+
+============================== CELL 66 (CODE) ==============================
+# Chỉnh metric, màu, smoothing và kích thước figure trực tiếp ở đây.
+if not boundary_history.empty:
+    metrics = [key for key in ['loss', 'epsilon_L1', 'LPIPS', 'restoration_RGB_L1'] if key in boundary_history]
+    if metrics:
+        fig, axes = plt.subplots(1, min(3,len(metrics)), figsize=(14,3.2), squeeze=False)
+        for ax, metric in zip(axes.flat, metrics[:3]):
+            ax.plot(boundary_history.step, boundary_history[metric], alpha=0.22, linewidth=0.7)
+            ax.plot(boundary_history.step, boundary_history[metric].rolling(50,min_periods=1).mean(), linewidth=1.5)
+            ax.set(xlabel="Optimizer update của stage", ylabel=metric)
+        save_figure(fig, "v21_loss_v41.png", "Huấn luyện")
+        show_inline(fig)
+        plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 67 (CODE) ==============================
+# Crop cùng tọa độ từ ảnh thật, ảnh sau sửa màu và output v2.
+# Chỉnh CROP_SIDE nếu muốn xem rộng/hẹp hơn; đây chỉ là crop, không sharpen ảnh.
+CROP_SIDE = 96
+if not background_gallery.empty:
+    row = background_gallery.iloc[0]
+    size = RUN['size']
+    mask = np.asarray(Image.open(row['mask']).convert('L').resize((size,size),Image.Resampling.NEAREST)) > 127
+    ys,xs = np.where(mask)
+    side = min(CROP_SIDE,size)
+    cx,cy = (int(np.median(xs)),int(np.median(ys))) if len(xs) else (size//2,size//2)
+    fx,fy = max(0,min(size-side,cx-side//2)), max(0,min(size-side,cy-side//2))
+    # Background crop maximizes background coverage, avoiding black corners when possible.
+    source = np.asarray(Image.open(row['source']).convert('RGB').resize((size,size)))
+    tissue = (source.max(-1)>25) & (~mask)
+    scores = torch.nn.functional.avg_pool2d(torch.from_numpy(tissue.astype('float32'))[None,None],side,stride=1)[0,0]
+    by,bx = divmod(int(scores.argmax()),scores.shape[-1])
+    fig,axes = plt.subplots(2,3,figsize=(10,7))
+    for col,(key,title) in enumerate([('real','Ảnh thật'),('source','Sau sửa màu'),('image','Nền v2')]):
+        image = np.asarray(Image.open(row[key]).convert('RGB').resize((size,size)))
+        axes[0,col].imshow(image[by:by+side,bx:bx+side]);axes[0,col].set_title(title+' · nền')
+        axes[1,col].imshow(image[fy:fy+side,fx:fx+side]);axes[1,col].set_title(title+' · polyp')
+    for ax in axes.flat: ax.axis('off')
+    save_figure(fig,'background_crops_v41.png','Kết quả trung gian')
+    show_inline(fig);plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 68 (CODE) ==============================
+# Có thể sửa columns, tiêu đề hoặc N_CASES; không có cột ảnh author trong panel trung gian.
+if not boundary_gallery.empty:
+    fig, axes = plt.subplots(len(boundary_gallery), 4, figsize=(13.6, 3.3*len(boundary_gallery)), squeeze=False)
+    for row_index, row in boundary_gallery.iterrows():
+        columns = [('mask','Mask'), ('real','Ảnh thật'), ('source','Sau sửa màu'), ('image', row['stage']+' · '+str(row['actual_updates']))]
+        for ax, (key,title) in zip(axes[row_index], columns):
+            image = Image.open(row[key]).convert('L' if key=='mask' else 'RGB')
+            ax.imshow(image, cmap='gray' if key=='mask' else None)
+            ax.set_title(title, fontsize=10)
+            ax.axis('off')
+    save_figure(fig, "boundary_gallery.png", "Kết quả trung gian")
+    show_inline(fig)
+    plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 69 (MARKDOWN) ==============================
+## H. Tiếp tục refiner đến tổng 49.000 update
+### H 1. Cùng trajectory và cùng mục tiêu
+
+
+
+============================== CELL 70 (CODE) ==============================
+def checkpoint(cfg, diff, opt, step, history, best, rank, world, device):
+    local = state_rng(device)
+    states = [None] * world
+    if world > 1:
+        dist.all_gather_object(states, local)
+    else:
+        states = [local]
+    if rank == 0:
+        value = {
+            "protocol": cfg["protocol"],
+            "model": diff.state_dict(),
+            "optimizer": opt.state_dict(),
+            "step": step,
+            "history": history,
+            "best": best,
+            "rng_by_rank": states,
+            "world_size": world,
+            "origin": "Selected v2 refiner + boundary-aware continuation; own DDPM/color bank unchanged",
+            "initial_refiner_updates": cfg["initial_refiner_updates"],
+        }
+        save_pt(Path(cfg["out"]) / "checkpoints/last.pt", value)
+        # Keep only baseline and latest committed BEST backup for crash rollback.
+        committed = max([r["step"] for r in history if r.get("improved")] or [0])
+        for previous in (Path(cfg["out"]) / "checkpoints").glob("best_*.pt"):
+            if previous.stem not in ["best_0", f"best_{committed}"]:
+                previous.unlink()
+        import pandas as pd
+
+        pd.DataFrame(history).to_csv(
+            Path(cfg["out"]) / "tables/training_history.csv", index=False
+        )
+        if step in cfg.get("snapshot_steps", []):
+            save_pt(Path(cfg["out"]) / "checkpoints" / f"step_{step}.pt", value)
+    if world > 1:
+        dist.barrier()
+
+
+@torch.no_grad()
+def snapshot_milestone(cfg, diff, step, rank, world, device):
+    total = int(cfg["initial_refiner_updates"]) + int(step)
+    if total not in cfg.get("milestone_totals", []):
+        return
+    root = Path(cfg["out"]).parent / "research_49k" / "milestones" / f"step_{total:06d}"
+    root.mkdir(parents=True, exist_ok=True)
+    rows = {r["id"]: r for r in cfg["records"]}
+    ids = cfg.get("milestone_ids", cfg["validation_ids"][:4])
+    rng = state_rng(device)
+    was_training = diff.training
+    diff.eval()
+    fingerprint = state_fingerprint(diff.state_dict())
+    try:
+        for sid in ids[rank::world]:
+            r = rows[sid]
+            path = root / (sid + ".png")
+            sidecar = path.with_suffix(".json")
+            seed = seed_for(sid, 0)
+            if path.exists() and sidecar.exists():
+                old = json.loads(sidecar.read_text())
+                if (
+                    old.get("total_updates") != total
+                    or old.get("state_sha256") != fingerprint
+                    or old.get("seed") != seed
+                    or old.get("source_sha256") != r["source_sha256"]
+                    or old.get("png_sha256") != digest(path)
+                ):
+                    raise ValueError("Milestone image identity mismatch")
+                continue
+            source = png(r["source"], cfg["size"])[None].to(device)
+            cond = (
+                png(r["mask"], cfg["size"], True).repeat(3, 1, 1)[None].to(device) * 2
+                - 1
+            )
+            palette = png(r["palette_image"], cfg["size"])[None].to(device)
+            image = background_reverse(
+                diff, source, cond, cfg["default_reverse_steps"], seed, cfg, palette
+            )
+            save_png(image[0], path)
+            write_json(
+                sidecar,
+                {
+                    "id": sid,
+                    "total_updates": total,
+                    "stage_step": step,
+                    "protocol": cfg["protocol"],
+                    "weights": "LAST at this exact milestone",
+                    "state_sha256": fingerprint,
+                    "seed": seed,
+                    "source_sha256": r["source_sha256"],
+                    "png_sha256": digest(path),
+                },
+            )
+            del source, cond, palette, image
+    finally:
+        diff.train(was_training)
+        restore_rng(rng, device)
+    if world > 1:
+        dist.barrier()
+    if rank == 0:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(len(ids), 4, figsize=(12, 3 * len(ids)), squeeze=False)
+        for i, sid in enumerate(ids):
+            r = rows[sid]
+            items = [
+                (png(r["mask"], cfg["size"], True)[0], "Condition"),
+                (png(r["image"], cfg["size"]).permute(1, 2, 0), "Real reference"),
+                (png(r["source"], cfg["size"]).permute(1, 2, 0), "After color repair"),
+                (
+                    png(root / (sid + ".png"), cfg["size"]).permute(1, 2, 0),
+                    f"Refiner LAST {total:,}",
+                ),
+            ]
+            for ax, (im, title) in zip(axes[i], items):
+                ax.imshow(im, cmap="gray" if im.ndim == 2 else None)
+                ax.set_title(title)
+                ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(root / "panel.png", dpi=130)
+        plt.close(fig)
+        write_json(
+            root / "manifest.json",
+            {
+                "total_updates": total,
+                "ids": ids,
+                "state_sha256": fingerprint,
+                "source": "Research refiner LAST; distinct from deployment generator",
+                "images": [
+                    json.loads((root / (sid + ".json")).read_text()) for sid in ids
+                ],
+            },
+        )
+        print(
+            f"MILESTONE {total:,}: images saved to research_49k/milestones/step_{total:06d}/",
+            flush=True,
+        )
+    if world > 1:
+        dist.barrier()
+
+
+============================== CELL 71 (MARKDOWN) ==============================
+### H 2. Một optimizer update thực sự làm gì?
+Lấy minibatch theo vị trí global; trộn trạng thái Gaussian/noise-restoration; tính epsilon và các loss; backward có gradient accumulation; clip rồi Adamstep.
+
+
+============================== CELL 72 (CODE) ==============================
+def refiner_update(
+    cfg, diff, teacher, per, net, opt, records, step, rank, world, device
+):
+    tick = time.monotonic()
+    diff.train()
+    # A new objective starts a new optimizer; same-study resume restores it exactly.
+    phase = min(1.0, step / max(cfg["train_steps"] - 1, 1))
+    lr = cfg["lr_min"] + 0.5 * (cfg["lr"] - cfg["lr_min"]) * (
+        1 + math.cos(math.pi * phase)
+    )
+    warm = min(1.0, (step + 1) / max(cfg["warmup_updates"], 1))
+    for group in opt.param_groups:
+        group["lr"] = lr * warm
+    opt.zero_grad(set_to_none=True)
+    components = torch.zeros(7, device=device)
+    seen = []
+    for micro in range(cfg["accumulation"]):
+        sync = (
+            contextlib.nullcontext()
+            if world == 1 or micro == cfg["accumulation"] - 1
+            else net.no_sync()
+        )
+        with sync:
+            clean, condition, ids = training_batch(
+                cfg, records, step, rank, world, micro
+            )
+            seen += ids
+            clean, condition = clean.to(device), condition.to(device)
+            t = torch.randint(0, cfg["train_t_max"] + 1, (len(clean),), device=device)
+            noisy, target, repair = mixed_training_state(
+                diff,
+                clean,
+                condition,
+                t,
+                cfg,
+                cfg["seed"] + step * 10000 + rank * 100 + micro,
+            )
+            with torch.no_grad():
+                teacher_eps = teacher.denoise_fn(torch.cat([noisy, condition], 1), t)
+            eps = net(torch.cat([noisy, condition], 1), t)
+            loss, parts = continuation_loss(
+                diff,
+                eps,
+                noisy,
+                clean,
+                target,
+                t,
+                condition,
+                per,
+                cfg,
+                teacher_eps,
+                ~repair,
+            )
+            finite = all_reduce(
+                torch.tensor(int(not torch.isfinite(loss)), device=device)
+            )
+            if finite.item():
+                raise RuntimeError("Nonfinite training loss on at least one rank")
+            (loss / cfg["accumulation"]).backward()
+            components += parts.detach() / cfg["accumulation"]
+            del (
+                clean,
+                condition,
+                t,
+                target,
+                repair,
+                noisy,
+                teacher_eps,
+                eps,
+                loss,
+                parts,
+            )
+    grad = torch.nn.utils.clip_grad_norm_(
+        net.parameters(), 1.0, error_if_nonfinite=True
+    )
+    opt.step()
+    step += 1
+    all_reduce(components)
+    components /= world
+    seconds = (
+        all_reduce(torch.tensor(time.monotonic() - tick, device=device)).item() / world
+    )
+    row = {
+        "step": step,
+        "epsilon_L1": float(components[0]),
+        "gradient_L1": float(components[1]),
+        "LPIPS": float(components[2]),
+        "prior_L1": float(components[3]),
+        "restoration_RGB_L1": float(components[4]),
+        "boundary_RGB_L1": float(components[5]),
+        "boundary_gradient_L1": float(components[6]),
+        "lr": opt.param_groups[0]["lr"],
+        "seconds_update": seconds,
+        "grad_norm": float(grad),
+    }
+    return row, len(seen)
+
+
+============================== CELL 73 (MARKDOWN) ==============================
+### H 3. training và validation
+
+
+============================== CELL 74 (CODE) ==============================
+def train(cfg):
+    rank, world, device = runtime(cfg, True)
+    records = {r["id"]: r for r in cfg["records"]}
+    diff = factory(cfg, device)
+    cp = load_pt(cfg["initial_checkpoint"])
+    if cp["protocol"] != cfg["initial_protocol"]:
+        raise ValueError("Incorrect initial refiner protocol")
+    diff.load_state_dict(cp["model"], strict=True)
+    del cp
+    teacher = factory(cfg, device)
+    cp = load_pt(cfg["initial_checkpoint"])
+    teacher.load_state_dict(cp["model"], strict=True)
+    del cp
+    teacher.eval().requires_grad_(False)
+    per = Perceptual(cfg, device)
+    net = (
+        DDP(
+            diff.denoise_fn,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            broadcast_buffers=False,
+        )
+        if world > 1
+        else diff.denoise_fn
+    )
+    opt = torch.optim.Adam(net.parameters(), lr=cfg["lr"])
+    path = Path(cfg["out"]) / "checkpoints/last.pt"
+    step = 0
+    history = []
+    best = float("inf")
+    if path.exists():
+        cp = load_pt(path)
+        if (
+            cp["protocol"]
+            not in [cfg["protocol"], *cfg.get("accepted_resume_protocols", [])]
+            or cp["world_size"] != world
+        ):
+            raise ValueError("Checkpoint/protocol/world size mismatch")
+        diff.load_state_dict(cp["model"])
+        opt.load_state_dict(cp["optimizer"])
+        step, history, best = cp["step"], cp["history"], cp["best"]
+        restore_rng(cp["rng_by_rank"][rank], device)
+        del cp
+    # Roll back a best write from a crashed, not-yet-checkpointed update if necessary.
+    best_path = Path(cfg["out"]) / "checkpoints/best.pt"
+    if best_path.exists():
+        selected = load_pt(best_path)
+        if selected["protocol"] not in [
+            cfg["protocol"],
+            *cfg.get("accepted_resume_protocols", []),
+        ]:
+            raise ValueError("Best checkpoint belongs to another protocol")
+        if selected["step"] > step:
+            selected_step = max(
+                [r["step"] for r in history if r.get("improved")] or [0]
+            )
+            del selected
+            if rank == 0:
+                shutil.copy2(best_path.with_name(f"best_{selected_step}.pt"), best_path)
+            if world > 1:
+                dist.barrier()
+        else:
+            del selected
+    loaded = step
+    validations = [x for x in history if "validation_score" in x]
+    failures = 0
+    for value in reversed(validations):
+        if value.get("improved", False):
+            break
+        failures += 1
+    early_stopped = (
+        not cfg.get("disable_quality_early_stop", False)
+    ) and failures >= cfg["patience_evals"]
+    initial_validation = Path(cfg["out"]) / "tables/initial_validation.json"
+    if not (Path(cfg["out"]) / "checkpoints/best.pt").exists():
+        if step:
+            raise ValueError("Missing best checkpoint for resumed training")
+        best, rows = validate(cfg, diff, records, per, rank, world, device)
+        if rank == 0:
+            save_pt(
+                Path(cfg["out"]) / "checkpoints/best.pt",
+                {
+                    "protocol": cfg["protocol"],
+                    "model": diff.state_dict(),
+                    "step": 0,
+                    "score": best,
+                    "validation": rows,
+                },
+            )
+            shutil.copy2(
+                Path(cfg["out"]) / "checkpoints/best.pt",
+                Path(cfg["out"]) / "checkpoints/best_0.pt",
+            )
+            write_json(Path(cfg["out"]) / "tables/restoration_validation_0.json", rows)
+            write_json(initial_validation, rows)
+        if world > 1:
+            dist.barrier()
+    if not initial_validation.exists():
+        raise ValueError(
+            "Missing step-zero restoration reference for same-study resume"
+        )
+    baseline_rows = json.loads(initial_validation.read_text())
+    baseline_fg = float(np.mean([r["foreground_LPIPS"] for r in baseline_rows]))
+    baseline_band = float(np.mean([r["boundary_RGB_L1"] for r in baseline_rows]))
+    if not path.exists():
+        checkpoint(cfg, diff, opt, step, history, best, rank, world, device)
+    telemetry(
+        cfg,
+        "train_start",
+        rank,
+        device,
+        world_size=world,
+        effective_batch=cfg["per_gpu_batch"] * world * cfg["accumulation"],
+    )
+    if cfg["initial_refiner_updates"] + step in cfg.get("milestone_totals", []):
+        checkpoint(cfg, diff, opt, step, history, best, rank, world, device)
+    snapshot_milestone(cfg, diff, step, rank, world, device)
+    while step < cfg["train_steps"] and not early_stopped:
+        if memory_stop(cfg, device):
+            break
+        row, examples_seen = refiner_update(
+            cfg, diff, teacher, per, net, opt, records, step, rank, world, device
+        )
+        step = row["step"]
+        history.append(row)
+        if step % cfg["log_every"] == 0:
+            print(
+                f'RANK {rank} refiner total={cfg["initial_refiner_updates"]+step}/{cfg["initial_refiner_updates"]+cfg["train_steps"]}; eps_L1={row["epsilon_L1"]:.5f}; RGB_L1={row["restoration_RGB_L1"]:.5f}; {row['seconds_update']:.2f}s/update',
+                flush=True,
+            )
+            telemetry(
+                cfg,
+                "train_progress",
+                rank,
+                device,
+                step=step,
+                examples_this_update=examples_seen,
+            )
+        if step % cfg["validate_every"] == 0 or step == cfg["train_steps"]:
+            score, rows = validate(cfg, diff, records, per, rank, world, device)
+            row["validation_score"] = score
+            if not math.isfinite(score):
+                raise RuntimeError("Nonfinite validation")
+            fg_score = float(np.mean([r["foreground_LPIPS"] for r in rows]))
+            band_score = float(np.mean([r["boundary_RGB_L1"] for r in rows]))
+            row["foreground_guard_pass"] = fg_score <= baseline_fg * 1.05 + 1e-4
+            row["boundary_guard_pass"] = band_score <= baseline_band * 1.05 + 1e-4
+            row["improved"] = (
+                score < best - cfg["min_delta"]
+                and row["foreground_guard_pass"]
+                and row["boundary_guard_pass"]
+            )
+            if row["improved"]:
+                best = score
+                failures = 0
+                if rank == 0:
+                    save_pt(
+                        Path(cfg["out"]) / "checkpoints/best.pt",
+                        {
+                            "protocol": cfg["protocol"],
+                            "model": diff.state_dict(),
+                            "step": step,
+                            "score": score,
+                            "validation": rows,
+                        },
+                    )
+                    shutil.copy2(
+                        Path(cfg["out"]) / "checkpoints/best.pt",
+                        Path(cfg["out"]) / "checkpoints" / f"best_{step}.pt",
+                    )
+            else:
+                failures += 1
+            early_stopped = (
+                not cfg.get("disable_quality_early_stop", False)
+            ) and failures >= cfg["patience_evals"]
+            if rank == 0:
+                write_json(
+                    Path(cfg["out"]) / "tables" / f"restoration_validation_{step}.json",
+                    rows,
+                )
+        milestone = cfg["initial_refiner_updates"] + step in cfg.get(
+            "milestone_totals", []
+        )
+        if step % cfg["save_every"] == 0 or step == cfg["train_steps"] or milestone:
+            checkpoint(cfg, diff, opt, step, history, best, rank, world, device)
+        if milestone:
+            snapshot_milestone(cfg, diff, step, rank, world, device)
+    if step > loaded or not path.exists():
+        checkpoint(cfg, diff, opt, step, history, best, rank, world, device)
+    # Same synchronized model fingerprint on each rank is additional plumbing evidence.
+    fingerprint = state_fingerprint(diff.state_dict())
+    telemetry(
+        cfg,
+        "train_done",
+        rank,
+        device,
+        step=step,
+        updates_this_launch=step - loaded,
+        full_state_sha256=fingerprint,
+        complete=step == cfg["train_steps"] or early_stopped,
+    )
+    if rank == 0:
+        write_json(
+            Path(cfg["out"]) / "train_status.json",
+            {
+                "step": step,
+                "complete": step == cfg["train_steps"] or early_stopped,
+                "budget_completed": step == cfg["train_steps"],
+                "early_stopped": early_stopped,
+                "initial_refiner_updates": cfg["initial_refiner_updates"],
+                "selected_v2_parent_protocol": cfg["initial_protocol"],
+                "protocol": cfg["protocol"],
+            },
+        )
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+============================== CELL 75 (CODE) ==============================
+RESEARCH_STAGE = run_extension(RUN, RUNTIME_SOURCES)
+report.milestone_inventory()
+
+
+============================== CELL 76 (CODE) ==============================
+continuation_history, continuation_history_status = read_history('continuation')
+display(continuation_history_status)
+save_table(continuation_history_status, "continuation_status_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain:       Giai đoạn  Update LAST của stage  Bản ghi log  Tổng refiner LAST  \ 0  continuation                  46000        46000              49000        Trạng thái   0  Có dữ kiện  
+
+
+============================== CELL 77 (CODE) ==============================
+# Chỉnh metric, màu, smoothing và kích thước figure trực tiếp ở đây.
+if not continuation_history.empty:
+    metrics = [key for key in ['loss', 'epsilon_L1', 'LPIPS', 'restoration_RGB_L1'] if key in continuation_history]
+    if metrics:
+        fig, axes = plt.subplots(1, min(3,len(metrics)), figsize=(14,3.2), squeeze=False)
+        for ax, metric in zip(axes.flat, metrics[:3]):
+            ax.plot(continuation_history.step, continuation_history[metric], alpha=0.22, linewidth=0.7)
+            ax.plot(continuation_history.step, continuation_history[metric].rolling(50,min_periods=1).mean(), linewidth=1.5)
+            ax.set(xlabel="Optimizer update của stage", ylabel=metric)
+        save_figure(fig, "continuation_loss_v41.png", "Huấn luyện")
+        show_inline(fig)
+        plt.close(fig)
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 78 (CODE) ==============================
+if not continuation_history.empty and 'data_pass_equivalent' in continuation_history:
+    log = continuation_history.copy()
+    log['pass_bin'] = np.floor(log.data_pass_equivalent).astype(int)
+    loss_key = 'loss' if 'loss' in log else 'epsilon_L1'
+    passes = log.groupby('pass_bin').agg(update_first=('step','min'), update_last=('step','max'), records=('step','size'), mean_loss=(loss_key,'mean')).reset_index()
+    # Bảng cuộn giữ toàn bộ các lượt quét có log; sửa passes.tail(20) nếu muốn rút ngắn.
+    from IPython.display import HTML
+    display(HTML('<div style="max-height:420px;overflow:auto">'+passes.to_html(index=False)+'</div>'))
+    save_table(log, "continuation_updates_full_v41.csv", "Huấn luyện")
+    save_table(passes, "continuation_passes_v41.csv", "Huấn luyện")
+
+--- OUTPUTS (1) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+
+
+============================== CELL 79 (MARKDOWN) ==============================
+### H4. Ảnh tại các mốc refiner
+
+
+============================== CELL 80 (CODE) ==============================
+if SHOW_RESEARCH_MILESTONES:
+    for milestone in RUN['milestone_totals']:
+        milestone_rows = intermediate_rows(f'milestone:{milestone}', limit=N_CASES, ids=DISPLAY_IDS)
+        if milestone_rows.empty:
+            continue
+        fig,axes = plt.subplots(len(milestone_rows),4,figsize=(14,3.3*len(milestone_rows)),squeeze=False)
+        for row_index,row in milestone_rows.iterrows():
+            columns=[('mask','Mask'),('real','Ảnh thật'),('source','Sau sửa màu'),('image',f'Refiner LAST · {milestone:,}')]
+            for ax,(key,title) in zip(axes[row_index],columns):
+                image=Image.open(row[key]).convert('L' if key=='mask' else 'RGB')
+                ax.imshow(image,cmap='gray' if key=='mask' else None);ax.set_title(title);ax.axis('off')
+        save_figure(fig,f'refiner_{milestone:06d}_v41.png','Tiếp tục huấn luyện')
+        show_inline(fig);plt.close(fig)
+
+
+============================== CELL 81 (MARKDOWN) ==============================
+## I. Sinh ảnh cuối ở mốc 49k
+
+
+============================== CELL 82 (CODE) ==============================
+%%implementation project_worker
+@torch.no_grad()
+def generate_author(cfg):
+    rank, world, device = runtime(cfg)
+    tasks = author_tasks(cfg)[rank::world]
+    records = {r["id"]: r for r in cfg["records"]}
+    diff = factory(cfg, device)
+    cp = load_pt(cfg["author_checkpoint"])
+    if "ema" not in cp:
+        raise ValueError("Author checkpoint must contain ema weights")
+    diff.load_state_dict(cp["ema"], strict=True)
+    reported_step = cp.get("step")
+    del cp
+    diff.eval().requires_grad_(False)
+    before = state_fingerprint(diff.state_dict())
+    done = 0
+    for task in tasks:
+        if resource_stop(cfg, device):
+            break
+        record = records[task["id"]]
+        path = Path(task["output"])
+        if validate_generated(path, task, cfg, record):
+            if (
+                not task["trace"]
+                or (Path(cfg["out"]) / "author/trace/manifest.json").exists()
+            ):
+                done += 1
+                continue
+        mask = png(record["mask"], cfg["size"], True)
+        cond = mask.repeat(3, 1, 1)[None].to(device) * 2 - 1
+        seed = seed_for("author:" + task["id"], task["replicate"])
+        image, frames = full_reverse(diff, cond, seed, task["trace"])
+        save_png(image[0], path)
+        mask_path = Path(cfg["out"]) / "author/masks" / (task["id"] + ".png")
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        # Replicates can be on different ranks: write a byte-identical atomic PNG.
+        tmp = mask_path.with_name(mask_path.stem + f".rank{rank}.tmp.png")
+        Image.fromarray((mask[0].numpy() * 255).astype("uint8")).save(tmp)
+        os.replace(tmp, mask_path)
+        if frames:
+            trace = []
+            for i, (x, title) in enumerate(frames):
+                name = f"{i:02}.png"
+                tp = Path(cfg["out"]) / "author/trace" / name
+                save_png((x + 1) / 2, tp)
+                trace.append({"file": name, "title": title, "sha256": digest(tp)})
+            write_json(
+                Path(cfg["out"]) / "author/trace/manifest.json",
+                {
+                    "id": task["id"],
+                    "seed": seed,
+                    "author_sha256": cfg["author_sha256"],
+                    "frames": trace,
+                },
+            )
+        write_json(
+            path.with_suffix(".json"),
+            {
+                "protocol": cfg["protocol"],
+                "author_sha256": cfg["author_sha256"],
+                "author_reported_step": reported_step,
+                "weights_key": "ema",
+                "id": task["id"],
+                "replicate": task["replicate"],
+                "seed": seed,
+                "original_mask_sha256": record["mask_sha256"],
+                "intended_mask_sha256": digest(mask_path),
+                "png_sha256": digest(path),
+                "postprocessing": "[-1,1] to [0,1], clip and PNG only; no color corrector/refiner",
+                "label_scope": "Conditioning mask, not independently annotated synthetic GT",
+            },
+        )
+        done += 1
+        if done % 10 == 0:
+            print(f"AUTHOR rank{rank}: {done}/{len(tasks)}", flush=True)
+    after = state_fingerprint(diff.state_dict())
+    if before != after:
+        raise RuntimeError("Frozen author weights changed")
+    telemetry(
+        cfg,
+        "author_inference",
+        rank,
+        device,
+        completed=done,
+        assigned=len(tasks),
+        author_sha256=cfg["author_sha256"],
+        full_state_before=before,
+        full_state_after=after,
+        author_reported_step=reported_step,
+    )
+
+--- OUTPUTS (1) ---
+  [out 0: stream] Đã nạp: generate_author 
+
+
+============================== CELL 83 (CODE) ==============================
+BANK = ensure_final_bank(RUN)
+report.table(pd.DataFrame([{
+    "Ảnh bank hợp lệ": BANK["count"], "Mục tiêu": BANK["expected"],
+    "Task hoàn tất": BANK["completed_tasks"], "Tổng task": BANK["expected_tasks"],
+    "Đã hoàn tất": BANK["complete"],
+}]), "final_bank_status_v4.csv", "Sinh ảnh cuối", "Trạng thái bank thực tế.")
+if BANK["complete"]:
+    report.final_gallery()
+else:
+    display(pd.DataFrame([{"Bank": "Chưa hoàn tất"}]))
+
+--- OUTPUTS (3) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 1: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 2: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+
+
+============================== CELL 84 (MARKDOWN) ==============================
+## J. Đánh giá ảnh sinh
+
+
+
+============================== CELL 85 (CODE) ==============================
+def kernel_mmd(a, b):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    d = ((b[:, None] - b[None, :]) ** 2).mean(-1)
+    positive = d[d > 1e-12]
+    bandwidth = float(np.median(positive)) if len(positive) else 1.0
+
+    def kernel(x, y):
+        z = ((x[:, None] - y[None, :]) ** 2).mean(-1)
+        return sum(np.exp(-z / (2 * bandwidth * s)) for s in [0.5, 1.0, 2.0]) / 3
+
+    return max(
+        0.0, float(kernel(a, a).mean() + kernel(b, b).mean() - 2 * kernel(a, b).mean())
+    )
+
+
+============================== CELL 86 (CODE) ==============================
+if BANK["complete"]:
+    if not quality_cached(RUN) and ACTION != "PRESENT_ONLY" and not resource_stop(RUN):
+        try:
+            launch(RUN, "quality")
+        except RuntimeError as error:
+            print("Đánh giá descriptor chưa hoàn tất:", error)
+    if quality_cached(RUN):
+        QUALITY = report.image_quality()
+    else:
+        display(pd.DataFrame([{"MMD": "Chưa đủ descriptor"}]))
+    if RUN["fid_enabled"] and ACTION != "PRESENT_ONLY" and not resource_stop(RUN):
+        try:
+            report.base.optional_fid()
+        except Exception as error:
+            print("FID chưa khả dụng:", error)
+    elif not RUN["fid_enabled"]:
+        print("FID: disabled theo cấu hình; không có điểm FID được suy đoán.")
+
+--- OUTPUTS (4) ---
+  [out 0: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 1: display_data] keys: ['text/html', 'text/plain']
+     text/plain: <IPython.core.display.HTML object>
+  [out 2: display_data] keys: ['image/png', 'text/plain']
+     text/plain: <IPython.core.display.Image object>
+  [out 3: stream] FID: disabled theo cấu hình; không có điểm FID được suy đoán. 
+
+
